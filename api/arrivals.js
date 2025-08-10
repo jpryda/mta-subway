@@ -1,9 +1,8 @@
 // Vercel Serverless Function: MTA GTFS-RT → JSON (no API key)
-// Fixes included: protobuf.parse, camelCase fields, prefix stop_id match, future-only filter.
+// Fixes: protobuf.parse, camelCase fields, prefix stop_id match, future-only filter, debug counters
 
 import protobuf from "protobufjs";
 
-// All subway feeds
 const FEEDS = [
   "nyct%2Fgtfs-ace",
   "nyct%2Fgtfs-bdfm",
@@ -17,7 +16,7 @@ const FEEDS = [
 ];
 const API_BASE = "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/";
 
-// Minimal GTFS-RT schema (proto2), parsed in-memory
+// Minimal GTFS-RT schema
 const SCHEMA = `
   syntax = "proto2";
   package transit_realtime;
@@ -35,12 +34,9 @@ const FeedMessage = root.lookupType("transit_realtime.FeedMessage");
 // Utilities
 const norm = s => (s || "").toLowerCase().replace(/street\b/g, "st").replace(/\s+/g, " ").trim();
 
-// Pre-mapped favorites (extend as you like)
 const STATION_TO_STOP_IDS = {
-  // Clark St (2/3)
   "clark st": ["R23N", "R23S", "R33N", "R33S"],
   "clark street": ["R23N", "R23S", "R33N", "R33S"],
-  // High St (A/C)
   "high st": ["A41N", "A41S", "C41N", "C41S"],
   "high street": ["A41N", "A41S", "C41N", "C41S"]
 };
@@ -61,13 +57,11 @@ async function fetchFeed(path) {
     const buf = new Uint8Array(await r.arrayBuffer());
     return FeedMessage.decode(buf);
   } catch (e) {
-    // transient non-protobuf responses (e.g., "invalid wire type ...") are skipped
-    return null;
+    return null; // skip invalid feeds
   }
 }
 
 export default async function handler(req, res) {
-  // CORS for Shortcuts/browser
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -79,7 +73,6 @@ export default async function handler(req, res) {
     const stopIdsParam = url.searchParams.get("stop_ids");
     const maxPerRoute = Math.max(1, Math.min(10, Number(url.searchParams.get("max_per_route") || 5)));
 
-    // Build stopIds from station or query
     let stopIds = [];
     if (stopIdsParam) {
       stopIds = stopIdsParam.split(",").map(s => s.trim()).filter(Boolean);
@@ -94,33 +87,42 @@ export default async function handler(req, res) {
     }
 
     const now = Math.floor(Date.now() / 1000);
-    const results = [];
+    const windowSeconds = Number(url.searchParams.get("window_seconds") || 0); 
+    const showDebug = url.searchParams.get("show_debug") === "1";
 
-    // Pull feeds and extract matching arrivals
+    const results = [];
+    let matchedNoTime = 0;
+    let matchedWithTime = 0;
+
     for (const f of FEEDS) {
       const msg = await fetchFeed(f);
       if (!msg) continue;
 
       for (const e of msg.entity) {
-        const tu = e.tripUpdate; // camelCase (was trip_update)
+        const tu = e.tripUpdate; // camelCase
         if (!tu) continue;
 
-        const route = tu.trip?.routeId || "?"; // camelCase (was route_id)
+        const route = tu.trip?.routeId || "?"; // camelCase
 
-        for (const stu of tu.stopTimeUpdate || []) { // camelCase (was stop_time_update)
-          const sid = stu.stopId; // camelCase (was stop_id)
+        for (const stu of tu.stopTimeUpdate || []) { // camelCase
+          const sid = stu.stopId; // camelCase
           if (!prefixMatch(sid, stopIds)) continue;
 
           const ts = Number(stu.arrival?.time || stu.departure?.time || 0);
-          // keep **future-only** predictions; ignore missing/old times
-          if (!ts || ts < now) continue;
+          if (!ts) { matchedNoTime++; continue; }
 
+          if (windowSeconds === 0) {
+            if (ts < now) continue;
+          } else {
+            if (ts < now - windowSeconds) continue;
+          }
+
+          matchedWithTime++;
           results.push({ route, stop_id: sid, arrival_epoch: ts });
         }
       }
     }
 
-    // Sort & group
     results.sort((a, b) => a.arrival_epoch - b.arrival_epoch);
     const byRoute = {};
     for (const r of results) {
@@ -131,11 +133,21 @@ export default async function handler(req, res) {
       }
     }
 
-    res.setHeader("Cache-Control", "s-maxage=15, stale-while-revalidate=30");
-    return res.status(200).json({
+    const payload = {
       meta: { station: stationParam || null, stop_ids: stopIds, generated_at: now, max_per_route: maxPerRoute },
       routes: byRoute
-    });
+    };
+    if (showDebug) {
+      payload.debug = {
+        matched_no_time: matchedNoTime,
+        matched_with_time: matchedWithTime,
+        window_seconds: windowSeconds
+      };
+    }
+
+    res.setHeader("Cache-Control", "s-maxage=15, stale-while-revalidate=30");
+    return res.status(200).json(payload);
+
   } catch (err) {
     return res.status(500).json({ error: err?.message || "server error" });
   }
