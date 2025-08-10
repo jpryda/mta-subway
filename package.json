@@ -1,0 +1,10 @@
+{
+  "name": "mta-arrivals",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "protobufjs": "^7.2.6"
+  }
+}
+
