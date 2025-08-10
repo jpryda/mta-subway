@@ -1,13 +1,14 @@
 // Vercel Serverless Function: Keyless MTA GTFS-RT → JSON arrivals
-// Usage examples:
-//   /api/arrivals?station=Clark%20St
-//   /api/arrivals?station=High%20St
-//   /api/arrivals?stop_ids=A41N,A41S,C41N,C41S
-// Optional: &max_per_route=5
+// Supports:
+//   ?station=Clark%20St   (Clark St - 2/3 trains)
+//   ?station=High%20St    (High St - A/C trains)
+//   ?stop_ids=A41N,A41S,...  (pass platform IDs directly)
+// Optional:
+//   ?max_per_route=5  (defaults to 5 per route)
 
 import protobuf from "protobufjs";
 
-// Official GTFS-RT feed groups (no API key needed)
+// Feed groups for all subway lines (no API key needed)
 const FEEDS = [
   "nyct%2Fgtfs-ace",
   "nyct%2Fgtfs-bdfm",
@@ -16,56 +17,70 @@ const FEEDS = [
   "nyct%2Fgtfs-l",
   "nyct%2Fgtfs-nqrw",
   "nyct%2Fgtfs-7",
-  "nyct%2Fgtfs",     // 1/2/3/4/5/6 lines
-  "nyct%2Fgtfs-si"   // Staten Island
+  "nyct%2Fgtfs",    // 1/2/3/4/5/6
+  "nyct%2Fgtfs-si"  // Staten Island
 ];
 
 const API_BASE = "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/";
 
-// Minimal inline GTFS-RT schema
-let rootPromise;
-async function loadSchema() {
-  if (!rootPromise) {
-    rootPromise = protobuf.load(`
-      syntax = "proto2";
-      package transit_realtime;
-      message FeedMessage { required FeedHeader header = 1; repeated FeedEntity entity = 2; }
-      message FeedHeader { required string gtfs_realtime_version = 1; optional int64 timestamp = 2; }
-      message FeedEntity { required string id = 1; optional TripUpdate trip_update = 3; }
-      message TripUpdate {
-        optional TripDescriptor trip = 1;
-        repeated StopTimeUpdate stop_time_update = 2;
-      }
-      message TripDescriptor { optional string route_id = 5; }
-      message StopTimeUpdate {
-        optional string stop_id = 1;
-        optional Event arrival = 2;
-        optional Event departure = 3;
-      }
-      message Event { optional int64 time = 1; }
-    `);
-  }
-  return rootPromise;
-}
+// Inline GTFS-RT schema parsed from string
+const SCHEMA_STRING = `
+  syntax = "proto2";
+  package transit_realtime;
 
-// Handy normalization for a couple of your stations
+  message FeedMessage {
+    required FeedHeader header = 1;
+    repeated FeedEntity entity = 2;
+  }
+
+  message FeedHeader {
+    required string gtfs_realtime_version = 1;
+    optional int64 timestamp = 2;
+  }
+
+  message FeedEntity {
+    required string id = 1;
+    optional TripUpdate trip_update = 3;
+  }
+
+  message TripUpdate {
+    optional TripDescriptor trip = 1;
+    repeated StopTimeUpdate stop_time_update = 2;
+  }
+
+  message TripDescriptor {
+    optional string route_id = 5;
+  }
+
+  message StopTimeUpdate {
+    optional string stop_id = 1;
+    optional Event arrival = 2;
+    optional Event departure = 3;
+  }
+
+  message Event {
+    optional int64 time = 1;
+  }
+`;
+
+const schemaRoot = protobuf.parse(SCHEMA_STRING).root;
+const FeedMessage = schemaRoot.lookupType("transit_realtime.FeedMessage");
+
+// Helper: normalize station name
 function norm(s) {
   return (s || "").toLowerCase().replace(/street\b/g, "st").replace(/\s+/g, " ").trim();
 }
 
-// Pre-mapped stop_ids for your two stations.
-// (You can extend this map later as you add favorites.)
+// Pre-mapped stop_ids for your two stations
 const STATION_TO_STOP_IDS = {
-  // Clark St (2/3)
   "clark st": ["R23N", "R23S", "R33N", "R33S"],
   "clark street": ["R23N", "R23S", "R33N", "R33S"],
-  // High St (A/C)
   "high st": ["A41N", "A41S", "C41N", "C41S"],
   "high street": ["A41N", "A41S", "C41N", "C41S"],
 };
 
 export default async function handler(req, res) {
-  // CORS: allow use from Shortcuts or browser
+  // Allow CORS for testing/Shortcuts
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -81,8 +96,7 @@ export default async function handler(req, res) {
     if (stopIdsParam) {
       stopIds = stopIdsParam.split(",").map(s => s.trim()).filter(Boolean);
     } else if (stationParam) {
-      const key = norm(stationParam);
-      const mapped = STATION_TO_STOP_IDS[key];
+      const mapped = STATION_TO_STOP_IDS[norm(stationParam)];
       if (!mapped) {
         return res.status(400).json({
           error: `Unknown station "${stationParam}". For now this endpoint supports Clark St and High St, or pass stop_ids explicitly.`
@@ -90,20 +104,20 @@ export default async function handler(req, res) {
       }
       stopIds = mapped;
     } else {
-      return res.status(400).json({ error: "Provide ?station=Clark St|High St or ?stop_ids=A41N,..." });
+      return res.status(400).json({
+        error: "Provide ?station=Clark St|High St or ?stop_ids=A41N,..."
+      });
     }
 
     const now = Math.floor(Date.now() / 1000);
-    const schema = await loadSchema();
-    const FeedMessage = schema.lookupType("transit_realtime.FeedMessage");
-
-    // Pull and parse all feeds
     const arrivals = [];
-    for (const f of FEEDS) {
+
+    // Fetch each feed and parse protobuf
+    for (const feed of FEEDS) {
       try {
-        const r = await fetch(`${API_BASE}${f}`);
-        if (!r.ok) continue;
-        const buf = Buffer.from(await r.arrayBuffer());
+        const resp = await fetch(`${API_BASE}${feed}`);
+        if (!resp.ok) continue;
+        const buf = Buffer.from(await resp.arrayBuffer());
         const msg = FeedMessage.decode(buf);
 
         for (const ent of msg.entity) {
@@ -126,31 +140,31 @@ export default async function handler(req, res) {
             });
           }
         }
-      } catch (_e) {
-        // Ignore a failing feed; others will still return data
+      } catch (err) {
+        // Ignore feed errors; continue to next
       }
     }
 
-    // Sort and group by route, trimming to maxPerRoute
+    // Sort by time, group by route
     arrivals.sort((a, b) => a.arrival_epoch - b.arrival_epoch);
     const byRoute = {};
-    for (const item of arrivals) {
-      (byRoute[item.route] ??= []);
-      if (byRoute[item.route].length < maxPerRoute) byRoute[item.route].push(item);
+    for (const a of arrivals) {
+      (byRoute[a.route] ??= []);
+      if (byRoute[a.route].length < maxPerRoute) {
+        byRoute[a.route].push(a);
+      }
     }
 
-    // Helpful meta
-    const meta = {
-      station: stationParam || null,
-      stop_ids: stopIds,
-      generated_at: now,
-      max_per_route: maxPerRoute
-    };
-
-    // Cache control: okay to cache briefly at the edge
     res.setHeader("Cache-Control", "s-maxage=15, stale-while-revalidate=30");
-
-    return res.status(200).json({ meta, routes: byRoute });
+    return res.status(200).json({
+      meta: {
+        station: stationParam || null,
+        stop_ids: stopIds,
+        generated_at: now,
+        max_per_route: maxPerRoute
+      },
+      routes: byRoute
+    });
   } catch (err) {
     return res.status(500).json({ error: err?.message || "server error" });
   }
