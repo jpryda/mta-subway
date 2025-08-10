@@ -1,5 +1,5 @@
 // Vercel Serverless Function: MTA GTFS-RT → JSON (no API key)
-// Multi-station support, camelCase fixes, prefix stop_id match, time window + debug
+// Grouped by station name; camelCase fixes; prefix stop_id match; time window + debug
 
 import protobuf from "protobufjs";
 
@@ -52,7 +52,7 @@ async function fetchFeed(path) {
     const r = await fetch(API_BASE + path, {
       headers: {
         "Accept": "application/x-protobuf",
-        "User-Agent": "mta-arrivals/1.1 (+vercel)"
+        "User-Agent": "mta-arrivals/1.2 (+vercel)"
       }
     });
     if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
@@ -80,10 +80,13 @@ export default async function handler(req, res) {
     const windowSeconds = Number(url.searchParams.get("window_seconds") || 0); // 0=future-only
     const showDebug = url.searchParams.get("show_debug") === "1";
 
-    // Resolve stations -> stop_ids, allow multiple stations
+    // Resolve stations -> stop_ids (support multiple stations)
     const stationsResolved = [];
     const unknownStations = [];
     const stopIdsSet = new Set();
+
+    // Map base stop_id prefix -> station display name for grouping
+    const baseToStation = new Map();
 
     if (stationRaw) {
       const names = stationRaw.split(",").map(s => s.trim()).filter(Boolean);
@@ -92,7 +95,10 @@ export default async function handler(req, res) {
         const mapped = STATION_TO_STOP_IDS[key];
         if (mapped && mapped.length) {
           stationsResolved.push(name);
-          for (const id of mapped) stopIdsSet.add(id);
+          for (const id of mapped) {
+            stopIdsSet.add(id);
+            baseToStation.set(id, name); // remember which station contributed this base id
+          }
         } else {
           unknownStations.push(name);
         }
@@ -102,10 +108,10 @@ export default async function handler(req, res) {
     if (stopIdsParam) {
       for (const id of stopIdsParam.split(",").map(s => s.trim()).filter(Boolean)) {
         stopIdsSet.add(id);
+        // if not already mapped to a station, leave unmapped; will appear under "Unknown" group
       }
     }
 
-    // Validate we have at least one stop_id
     const stopIds = Array.from(stopIdsSet);
     if (!stopIds.length) {
       return res.status(400).json({
@@ -114,9 +120,25 @@ export default async function handler(req, res) {
     }
 
     const now = Math.floor(Date.now() / 1000);
-    const results = [];
     let matchedNoTime = 0;
     let matchedWithTime = 0;
+
+    // stations -> routes -> arrivals[]
+    const stationsObj = {};
+
+    // Helper to place an arrival into the correct station+route bucket
+    function pushArrival(sid, route, ts) {
+      // Figure out which station this sid belongs to by prefix against our base ids
+      // Prefer explicit station mapping; else fallback to "Unknown"
+      let stationName = "Unknown";
+      for (const [base, name] of baseToStation.entries()) {
+        if (sid.startsWith(base)) { stationName = name; break; }
+      }
+      const s = (stationsObj[stationName] ??= {});
+      const r = (s[route] ??= []);
+      const in_min = Math.max(0, Math.round((ts - now) / 60));
+      r.push({ stop_id: sid, arrival_epoch: ts, in_min });
+    }
 
     // Fetch feeds and collect matches
     for (const f of FEEDS) {
@@ -144,19 +166,16 @@ export default async function handler(req, res) {
           }
 
           matchedWithTime++;
-          results.push({ route, stop_id: sid, arrival_epoch: ts });
+          pushArrival(sid, route, ts);
         }
       }
     }
 
-    // Sort and group by route
-    results.sort((a, b) => a.arrival_epoch - b.arrival_epoch);
-    const byRoute = {};
-    for (const r of results) {
-      (byRoute[r.route] ??= []);
-      if (byRoute[r.route].length < maxPerRoute) {
-        const in_min = Math.max(0, Math.round((r.arrival_epoch - now) / 60));
-        byRoute[r.route].push({ stop_id: r.stop_id, arrival_epoch: r.arrival_epoch, in_min });
+    // Sort and trim each station's routes
+    for (const [stationName, routes] of Object.entries(stationsObj)) {
+      for (const [route, arrs] of Object.entries(routes)) {
+        arrs.sort((a, b) => a.arrival_epoch - b.arrival_epoch);
+        routes[route] = arrs.slice(0, maxPerRoute);
       }
     }
 
@@ -169,7 +188,7 @@ export default async function handler(req, res) {
         max_per_route: maxPerRoute,
         window_seconds: windowSeconds
       },
-      routes: byRoute
+      stations: stationsObj // <-- grouped by station name
     };
 
     if (showDebug) {
