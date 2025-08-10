@@ -1,10 +1,10 @@
 {
-  "name": "mta-arrivals",
+  "name": "mta-subway",
   "version": "1.0.0",
-  "type": "module",
   "private": true,
+  "type": "module",
   "dependencies": {
-    "protobufjs": "^7.2.6"
+    "protobufjs": "^7.5.3"
   }
 }
 
