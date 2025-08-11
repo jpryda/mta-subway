@@ -65,11 +65,12 @@ const norm = s => (s || "").toLowerCase().replace(/street\b/g, "st").replace(/\s
 
 const STATION_TO_STOP_IDS = {
   // Clark St (2/3)
-  "clark st": ["R23N", "R23S", "R33N", "R33S"],
-  "clark street": ["R23N", "R23S", "R33N", "R33S"],
-  // High St (A/C)
-  "high st": ["A41N", "A41S", "C41N", "C41S"],
-  "high street": ["A41N", "A41S", "C41N", "C41S"]
+  "clark st": ["231N", "231S"],
+  "clark street": ["231N", "231S"],
+
+  // High St (A/C) — A & C share the same stop_id base here
+  "high st": ["A41N", "A41S"],
+  "high street": ["A41N", "A41S"]
 };
 
 function prefixMatch(sid, ids) {
