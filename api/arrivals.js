@@ -69,8 +69,8 @@ const STATION_TO_STOP_IDS = {
   "clark street": ["231N", "231S"],
 
   // High St (A/C) — A & C share the same stop_id base here
-  "high st": ["A41N", "A41S"],
-  "high street": ["A41N", "A41S"]
+  "high st": ["A40N", "A40S"],
+  "high street": ["A40N", "A40S"]
 };
 
 function prefixMatch(sid, ids) {
