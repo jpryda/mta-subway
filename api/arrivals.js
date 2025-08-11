@@ -1,5 +1,6 @@
 // Vercel Serverless Function: MTA GTFS-RT → JSON (no API key)
 // Grouped by station; multi-station; prefix stop_id match; rich debug with raw dump and interpretation.
+// Adds fallback that treats epoch-like delay as time, and flags entries with used_delay_as_time: true.
 
 import protobuf from "protobufjs";
 
@@ -84,7 +85,7 @@ async function fetchFeed(path) {
     const r = await fetch(API_BASE + path, {
       headers: {
         "Accept": "application/x-protobuf",
-        "User-Agent": "mta-arrivals/1.8 (+vercel)"
+        "User-Agent": "mta-arrivals/1.9 (+vercel)"
       }
     });
     if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
@@ -162,7 +163,7 @@ export default async function handler(req, res) {
     }
 
     const now = Math.floor(Date.now() / 1000);
-    let matchedNoTime = 0, matchedWithTime = 0;
+    let matchedNoTime = 0, matchedWithTime = 0, usedDelayAsTimeCount = 0;
     let totalEntities = 0, totalTripUpdates = 0, totalStopTimeUpdates = 0;
 
     const sampleSet = new Set();
@@ -192,7 +193,7 @@ export default async function handler(req, res) {
     }
 
     function maybeAddSample(sid) {
-      if (sid) sampleSet.add(sid); // keep all; or cap to N if you prefer
+      if (sid) sampleSet.add(sid); // keep all; or cap to N if desired
     }
 
     // Fetch feeds and collect matches
@@ -217,44 +218,52 @@ export default async function handler(req, res) {
           if (!prefixMatch(sid, stopIds)) continue;
 
           const route = tu.trip?.routeId || "?";
+
+          // raw fields
           const aTime = stu.arrival?.time ?? null;
-          const aDelay = stu.arrival?.delay ?? null;
           const dTime = stu.departure?.time ?? null;
+          const aDelay = stu.arrival?.delay ?? null;
           const dDelay = stu.departure?.delay ?? null;
 
-          const ts = Number(aTime || dTime || 0);
+          // 1) normal: use absolute time if present
+          let ts = Number(aTime || dTime || 0);
+          let usedDelayAsTime = false;
+
+          // 2) fallback: treat any "delay" > 2005-01-01 as an epoch (non-standard feed behavior)
+          if (!ts) {
+            const delayCandidates = [aDelay, dDelay].filter(v => v != null);
+            const delayEpoch = delayCandidates.find(v => Number(v) > EPOCH_GUESS_THRESHOLD);
+            if (delayEpoch) {
+              ts = Number(delayEpoch);
+              usedDelayAsTime = true;
+              usedDelayAsTimeCount++;
+            }
+          }
 
           if (!ts) {
+            // no usable time → "approaching"
             matchedNoTime++;
             matchedNoTimeSet.add(sid);
 
-            // Persist raw fields & interpretation (only if show_debug)
             if (showDebug) {
-              const detail = {
-                stop_id: sid,
-                route
-              };
-              if (rawDump) {
-                detail.arrival_raw = stu.arrival || null;
-                detail.departure_raw = stu.departure || null;
-              }
-              detail.interpret = {
-                arrival_time_epoch: aTime,
-                arrival_time_iso: asIso(aTime),
+              const detail = { stop_id: sid, route, interpret: {
+                arrival_time_epoch: aTime, arrival_time_iso: asIso(aTime),
                 arrival_delay_seconds: aDelay,
                 arrival_delay_looks_like_epoch: (aDelay != null && Number(aDelay) > EPOCH_GUESS_THRESHOLD),
                 arrival_delay_as_time_iso_if_epoch: (aDelay != null && Number(aDelay) > EPOCH_GUESS_THRESHOLD) ? asIso(aDelay) : null,
 
-                departure_time_epoch: dTime,
-                departure_time_iso: asIso(dTime),
+                departure_time_epoch: dTime, departure_time_iso: asIso(dTime),
                 departure_delay_seconds: dDelay,
                 departure_delay_looks_like_epoch: (dDelay != null && Number(dDelay) > EPOCH_GUESS_THRESHOLD),
                 departure_delay_as_time_iso_if_epoch: (dDelay != null && Number(dDelay) > EPOCH_GUESS_THRESHOLD) ? asIso(dDelay) : null
-              };
+              }};
+              if (rawDump) {
+                detail.arrival_raw = stu.arrival || null;
+                detail.departure_raw = stu.departure || null;
+              }
               matchedNoTimeDetails.push(detail);
             }
 
-            // Surface as "approaching", include delay_seconds if present
             const delaySec = (aDelay ?? dDelay ?? null);
             const entry = {
               stop_id: sid,
@@ -275,7 +284,13 @@ export default async function handler(req, res) {
           }
 
           matchedWithTime++;
-          pushArrival(sid, route, ts);
+          const entry = {
+            stop_id: sid,
+            arrival_epoch: ts,
+            in_min: Math.max(0, Math.round((ts - now) / 60))
+          };
+          if (usedDelayAsTime) entry.used_delay_as_time = true; // ✅ flag the fallback
+          pushArrival(sid, route, ts, entry);
         }
       }
     }
@@ -307,6 +322,7 @@ export default async function handler(req, res) {
       payload.debug = {
         matched_no_time: matchedNoTime,
         matched_with_time: matchedWithTime,
+        used_delay_as_time_count: usedDelayAsTimeCount, // ✅ summary count
         total_entities: totalEntities,
         total_trip_updates: totalTripUpdates,
         total_stop_time_updates: totalStopTimeUpdates,
