@@ -1,5 +1,5 @@
 // Vercel Serverless Function: MTA GTFS-RT → JSON (no API key)
-// Grouped by station name; with debug counters + sample stop_ids for mapping verification
+// Grouped by station name; correct GTFS-RT field numbers; debug sampler; prefix stop_id match.
 
 import protobuf from "protobufjs";
 
@@ -16,16 +16,47 @@ const FEEDS = [
 ];
 const API_BASE = "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/";
 
+// ✅ Correct GTFS-RT field numbers (notably stop_id = 4)
 const SCHEMA = `
   syntax = "proto2";
   package transit_realtime;
-  message FeedMessage { required FeedHeader header = 1; repeated FeedEntity entity = 2; }
-  message FeedHeader { required string gtfs_realtime_version = 1; optional int64 timestamp = 2; }
-  message FeedEntity { required string id = 1; optional TripUpdate trip_update = 3; }
-  message TripUpdate { optional TripDescriptor trip = 1; repeated StopTimeUpdate stop_time_update = 2; }
-  message TripDescriptor { optional string route_id = 5; }
-  message StopTimeUpdate { optional string stop_id = 1; optional Event arrival = 2; optional Event departure = 3; }
-  message Event { optional int64 time = 1; }
+
+  message FeedMessage {
+    required FeedHeader header = 1;
+    repeated FeedEntity entity = 2;
+  }
+
+  message FeedHeader {
+    required string gtfs_realtime_version = 1;
+    optional int64 timestamp = 2;
+  }
+
+  message FeedEntity {
+    required string id = 1;
+    optional TripUpdate trip_update = 3;
+  }
+
+  message TripUpdate {
+    optional TripDescriptor trip = 1;
+    repeated StopTimeUpdate stop_time_update = 2;
+  }
+
+  message TripDescriptor {
+    optional string route_id = 5;
+  }
+
+  message StopTimeUpdate {
+    optional uint32 stop_sequence = 1;
+    optional Event arrival = 2;
+    optional Event departure = 3;
+    optional string stop_id = 4; // 👈 correct field number
+    // optional ScheduleRelationship schedule_relationship = 5; // not needed here
+  }
+
+  message Event {
+    optional int64 time = 1;
+    // optional int32 delay = 2;
+  }
 `;
 const root = protobuf.parse(SCHEMA).root;
 const FeedMessage = root.lookupType("transit_realtime.FeedMessage");
@@ -50,14 +81,14 @@ async function fetchFeed(path) {
     const r = await fetch(API_BASE + path, {
       headers: {
         "Accept": "application/x-protobuf",
-        "User-Agent": "mta-arrivals/1.3 (+vercel)"
+        "User-Agent": "mta-arrivals/1.4 (+vercel)"
       }
     });
     if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
     const buf = new Uint8Array(await r.arrayBuffer());
     return FeedMessage.decode(buf);
   } catch {
-    return null;
+    return null; // tolerate transient non-protobuf responses
   }
 }
 
@@ -70,10 +101,10 @@ export default async function handler(req, res) {
   try {
     const url = new URL(req.url, "http://localhost");
 
-    const stationRaw = url.searchParams.get("station");
-    const stopIdsParam = url.searchParams.get("stop_ids");
+    const stationRaw = url.searchParams.get("station");     // comma-separated ok
+    const stopIdsParam = url.searchParams.get("stop_ids");  // comma-separated ok
     const maxPerRoute = Math.max(1, Math.min(10, Number(url.searchParams.get("max_per_route") || 5)));
-    const windowSeconds = Number(url.searchParams.get("window_seconds") || 0);
+    const windowSeconds = Number(url.searchParams.get("window_seconds") || 0); // 0 = future-only
     const showDebug = url.searchParams.get("show_debug") === "1";
 
     const stationsResolved = [];
@@ -144,15 +175,15 @@ export default async function handler(req, res) {
       totalEntities += msg.entity.length;
 
       for (const e of msg.entity) {
-        const tu = e.tripUpdate;
+        const tu = e.tripUpdate; // camelCase
         if (!tu) continue;
 
         totalTripUpdates++;
 
-        for (const stu of tu.stopTimeUpdate || []) {
+        for (const stu of tu.stopTimeUpdate || []) { // camelCase
           totalStopTimeUpdates++;
 
-          const sid = stu.stopId;
+          const sid = stu.stopId; // ✅ now populated (correct field number)
           maybeAddSample(sid);
 
           if (!prefixMatch(sid, stopIds)) continue;
@@ -161,9 +192,9 @@ export default async function handler(req, res) {
           if (!ts) { matchedNoTime++; continue; }
 
           if (windowSeconds === 0) {
-            if (ts < now) continue;
+            if (ts < now) continue;          // future only
           } else {
-            if (ts < now - windowSeconds) continue;
+            if (ts < now - windowSeconds) continue; // allow small lookback
           }
 
           matchedWithTime++;
@@ -173,6 +204,7 @@ export default async function handler(req, res) {
       }
     }
 
+    // Sort & trim for each station
     for (const [stationName, routes] of Object.entries(stationsObj)) {
       for (const [route, arrs] of Object.entries(routes)) {
         arrs.sort((a, b) => a.arrival_epoch - b.arrival_epoch);
