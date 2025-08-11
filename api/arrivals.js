@@ -1,5 +1,5 @@
 // Vercel Serverless Function: MTA GTFS-RT → JSON (no API key)
-// Grouped by station; multiple stations; prefix stop_id match; detailed debug; supports delay/uncertainty.
+// Grouped by station; multi-station; prefix stop_id match; rich debug with raw dump and interpretation.
 
 import protobuf from "protobufjs";
 
@@ -84,7 +84,7 @@ async function fetchFeed(path) {
     const r = await fetch(API_BASE + path, {
       headers: {
         "Accept": "application/x-protobuf",
-        "User-Agent": "mta-arrivals/1.7 (+vercel)"
+        "User-Agent": "mta-arrivals/1.8 (+vercel)"
       }
     });
     if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
@@ -94,6 +94,18 @@ async function fetchFeed(path) {
     return null; // tolerate transient non-protobuf responses
   }
 }
+
+// ---------- Debug helpers ----------
+function asIso(sec) {
+  if (sec == null) return null;
+  const n = Number(sec);
+  if (!Number.isFinite(n)) return null;
+  return new Date(n * 1000).toISOString();
+}
+// Heuristic: anything > 2005-01-01 looks like an epoch, not a delay
+const EPOCH_GUESS_THRESHOLD = 1104537600;
+
+// -----------------------------------
 
 export default async function handler(req, res) {
   // CORS
@@ -111,6 +123,7 @@ export default async function handler(req, res) {
     const maxPerRoute = Math.max(1, Math.min(10, Number(url.searchParams.get("max_per_route") || 5)));
     const windowSeconds = Number(url.searchParams.get("window_seconds") || 0); // 0 = future-only
     const showDebug = url.searchParams.get("show_debug") === "1";
+    const rawDump = url.searchParams.get("raw_dump") === "1"; // include raw arrival/departure in debug
 
     // Resolve stations -> stop_ids (support multiple stations)
     const stationsResolved = [];
@@ -179,7 +192,7 @@ export default async function handler(req, res) {
     }
 
     function maybeAddSample(sid) {
-      if (sampleSet.size < 50 && sid) sampleSet.add(sid);
+      if (sid) sampleSet.add(sid); // keep all; or cap to N if you prefer
     }
 
     // Fetch feeds and collect matches
@@ -204,31 +217,45 @@ export default async function handler(req, res) {
           if (!prefixMatch(sid, stopIds)) continue;
 
           const route = tu.trip?.routeId || "?";
-          const tArrival = stu.arrival?.time ?? null;
-          const tDeparture = stu.departure?.time ?? null;
-          const ts = Number(tArrival || tDeparture || 0);
+          const aTime = stu.arrival?.time ?? null;
+          const aDelay = stu.arrival?.delay ?? null;
+          const dTime = stu.departure?.time ?? null;
+          const dDelay = stu.departure?.delay ?? null;
+
+          const ts = Number(aTime || dTime || 0);
 
           if (!ts) {
             matchedNoTime++;
             matchedNoTimeSet.add(sid);
-            // Persist raw fields for inspection
-            matchedNoTimeDetails.push({
-              stop_id: sid,
-              route,
-              arrival: {
-                time: stu.arrival?.time ?? null,
-                delay: stu.arrival?.delay ?? null,
-                uncertainty: stu.arrival?.uncertainty ?? null
-              },
-              departure: {
-                time: stu.departure?.time ?? null,
-                delay: stu.departure?.delay ?? null,
-                uncertainty: stu.departure?.uncertainty ?? null
+
+            // Persist raw fields & interpretation (only if show_debug)
+            if (showDebug) {
+              const detail = {
+                stop_id: sid,
+                route
+              };
+              if (rawDump) {
+                detail.arrival_raw = stu.arrival || null;
+                detail.departure_raw = stu.departure || null;
               }
-            });
+              detail.interpret = {
+                arrival_time_epoch: aTime,
+                arrival_time_iso: asIso(aTime),
+                arrival_delay_seconds: aDelay,
+                arrival_delay_looks_like_epoch: (aDelay != null && Number(aDelay) > EPOCH_GUESS_THRESHOLD),
+                arrival_delay_as_time_iso_if_epoch: (aDelay != null && Number(aDelay) > EPOCH_GUESS_THRESHOLD) ? asIso(aDelay) : null,
+
+                departure_time_epoch: dTime,
+                departure_time_iso: asIso(dTime),
+                departure_delay_seconds: dDelay,
+                departure_delay_looks_like_epoch: (dDelay != null && Number(dDelay) > EPOCH_GUESS_THRESHOLD),
+                departure_delay_as_time_iso_if_epoch: (dDelay != null && Number(dDelay) > EPOCH_GUESS_THRESHOLD) ? asIso(dDelay) : null
+              };
+              matchedNoTimeDetails.push(detail);
+            }
 
             // Surface as "approaching", include delay_seconds if present
-            const delaySec = (stu.arrival?.delay ?? stu.departure?.delay ?? null);
+            const delaySec = (aDelay ?? dDelay ?? null);
             const entry = {
               stop_id: sid,
               arrival_epoch: null,
@@ -274,6 +301,9 @@ export default async function handler(req, res) {
     };
 
     if (showDebug) {
+      // Always include requested stopIds in the sample set for visibility
+      for (const id of stopIds) sampleSet.add(id);
+
       payload.debug = {
         matched_no_time: matchedNoTime,
         matched_with_time: matchedWithTime,
