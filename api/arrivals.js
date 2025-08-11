@@ -175,7 +175,8 @@ export default async function handler(req, res) {
     }
 
     function maybeAddSample(sid) {
-      if (sampleSet.size < 50 && sid) sampleSet.add(sid);
+      // if (sampleSet.size < 50 && sid) sampleSet.add(sid);
+      if (sid) sampleSet.add(sid);
     }
 
     // Fetch feeds and collect matches
