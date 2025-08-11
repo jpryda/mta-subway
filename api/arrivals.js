@@ -1,5 +1,5 @@
 // Vercel Serverless Function: MTA GTFS-RT → JSON (no API key)
-// Grouped by station; multiple stations; prefix stop_id match; detailed debug for "no time" matches.
+// Grouped by station; multiple stations; prefix stop_id match; detailed debug; supports delay/uncertainty.
 
 import protobuf from "protobufjs";
 
@@ -14,9 +14,10 @@ const FEEDS = [
   "nyct%2Fgtfs",     // 1/2/3/4/5/6
   "nyct%2Fgtfs-si"   // Staten Island
 ];
+
 const API_BASE = "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/";
 
-// ✅ Correct GTFS-RT field numbers (notably stop_id = 4)
+// ✅ Correct GTFS-RT field numbers; Event reads time/delay/uncertainty
 const SCHEMA = `
   syntax = "proto2";
   package transit_realtime;
@@ -54,10 +55,11 @@ const SCHEMA = `
 
   message Event {
     optional int64 time = 1;
-    // optional int32 delay = 2;
-    // optional int32 uncertainty = 3;
+    optional int32 delay = 2;
+    optional int32 uncertainty = 3;
   }
 `;
+
 const root = protobuf.parse(SCHEMA).root;
 const FeedMessage = root.lookupType("transit_realtime.FeedMessage");
 
@@ -68,8 +70,7 @@ const STATION_TO_STOP_IDS = {
   // Clark St (2/3)
   "clark st": ["231N", "231S"],
   "clark street": ["231N", "231S"],
-
-  // High St (A/C) — High St uses A40* in static; C shows via routeId
+  // High St (A/C) — A40*; C will appear via routeId
   "high st": ["A40N", "A40S"],
   "high street": ["A40N", "A40S"]
 };
@@ -83,7 +84,7 @@ async function fetchFeed(path) {
     const r = await fetch(API_BASE + path, {
       headers: {
         "Accept": "application/x-protobuf",
-        "User-Agent": "mta-arrivals/1.6 (+vercel)"
+        "User-Agent": "mta-arrivals/1.7 (+vercel)"
       }
     });
     if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
@@ -115,7 +116,7 @@ export default async function handler(req, res) {
     const stationsResolved = [];
     const unknownStations = [];
     const stopIdsSet = new Set();
-    const baseToStation = new Map(); // map base stop_id prefix to station name
+    const baseToStation = new Map(); // base stop_id prefix -> station display name
 
     if (stationRaw) {
       for (const name of stationRaw.split(",").map(s => s.trim()).filter(Boolean)) {
@@ -136,7 +137,7 @@ export default async function handler(req, res) {
     if (stopIdsParam) {
       for (const id of stopIdsParam.split(",").map(s => s.trim()).filter(Boolean)) {
         stopIdsSet.add(id);
-        // if not in baseToStation, it will fall under "Unknown" group
+        // if not mapped, will appear under "Unknown"
       }
     }
 
@@ -153,30 +154,32 @@ export default async function handler(req, res) {
 
     const sampleSet = new Set();
     const matchedNoTimeSet = new Set();
-    const matchedNoTimeDetails = []; // ✅ capture detail for no-time matches
+    const matchedNoTimeDetails = [];
 
+    // station -> route -> [arrivals]
     const stationsObj = {};
 
-    function pushArrival(sid, route, ts) {
-      // map sid back to a station display name via base prefix
+    // Push helper (supports override entry for no-time/extra fields)
+    function pushArrival(sid, route, ts, entryOverride) {
       let stationName = "Unknown";
       for (const [base, name] of baseToStation.entries()) {
         if (sid.startsWith(base)) { stationName = name; break; }
       }
       const s = (stationsObj[stationName] ??= {});
       const r = (s[route] ??= []);
-      const entry = {
-        stop_id: sid,
-        arrival_epoch: ts ?? null,
-        in_min: ts == null ? null : Math.max(0, Math.round((ts - now) / 60))
-      };
-      if (ts == null) entry.status = "approaching";
-      r.push(entry);
+      if (entryOverride) {
+        r.push(entryOverride);
+      } else {
+        r.push({
+          stop_id: sid,
+          arrival_epoch: ts,
+          in_min: Math.max(0, Math.round((ts - now) / 60))
+        });
+      }
     }
 
     function maybeAddSample(sid) {
-      // if (sampleSet.size < 50 && sid) sampleSet.add(sid);
-      if (sid) sampleSet.add(sid);
+      if (sampleSet.size < 50 && sid) sampleSet.add(sid);
     }
 
     // Fetch feeds and collect matches
@@ -195,25 +198,45 @@ export default async function handler(req, res) {
         for (const stu of tu.stopTimeUpdate || []) { // camelCase
           totalStopTimeUpdates++;
 
-          const sid = stu.stopId; // ✅ populated via correct schema
+          const sid = stu.stopId; // from correct schema
           maybeAddSample(sid);
 
           if (!prefixMatch(sid, stopIds)) continue;
 
           const route = tu.trip?.routeId || "?";
-          const ts = Number(stu.arrival?.time || stu.departure?.time || 0);
+          const tArrival = stu.arrival?.time ?? null;
+          const tDeparture = stu.departure?.time ?? null;
+          const ts = Number(tArrival || tDeparture || 0);
 
           if (!ts) {
             matchedNoTime++;
             matchedNoTimeSet.add(sid);
+            // Persist raw fields for inspection
             matchedNoTimeDetails.push({
               stop_id: sid,
               route,
-              arrival: stu.arrival || null,
-              departure: stu.departure || null
+              arrival: {
+                time: stu.arrival?.time ?? null,
+                delay: stu.arrival?.delay ?? null,
+                uncertainty: stu.arrival?.uncertainty ?? null
+              },
+              departure: {
+                time: stu.departure?.time ?? null,
+                delay: stu.departure?.delay ?? null,
+                uncertainty: stu.departure?.uncertainty ?? null
+              }
             });
-            // surface as "approaching"
-            pushArrival(sid, route, null);
+
+            // Surface as "approaching", include delay_seconds if present
+            const delaySec = (stu.arrival?.delay ?? stu.departure?.delay ?? null);
+            const entry = {
+              stop_id: sid,
+              arrival_epoch: null,
+              in_min: null,
+              status: "approaching"
+            };
+            if (delaySec != null) entry.delay_seconds = delaySec;
+            pushArrival(sid, route, null, entry);
             continue;
           }
 
@@ -221,7 +244,7 @@ export default async function handler(req, res) {
           if (windowSeconds === 0) {
             if (ts < now) continue;               // future only
           } else {
-            if (ts < now - windowSeconds) continue; // allow slight lookback
+            if (ts < now - windowSeconds) continue; // allow lookback
           }
 
           matchedWithTime++;
@@ -230,7 +253,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // Sort & trim each station/route
+    // Sort & trim per station/route
     for (const [stationName, routes] of Object.entries(stationsObj)) {
       for (const [route, arrs] of Object.entries(routes)) {
         arrs.sort((a, b) => (a.arrival_epoch ?? Infinity) - (b.arrival_epoch ?? Infinity));
