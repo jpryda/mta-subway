@@ -1,5 +1,5 @@
 // Vercel Serverless Function: MTA GTFS-RT → JSON (no API key)
-// Grouped by station name; correct GTFS-RT field numbers; debug sampler; prefix stop_id match.
+// Grouped by station; multiple stations; prefix stop_id match; detailed debug for "no time" matches.
 
 import protobuf from "protobufjs";
 
@@ -50,12 +50,12 @@ const SCHEMA = `
     optional Event arrival = 2;
     optional Event departure = 3;
     optional string stop_id = 4; // 👈 correct field number
-    // optional ScheduleRelationship schedule_relationship = 5; // not needed here
   }
 
   message Event {
     optional int64 time = 1;
     // optional int32 delay = 2;
+    // optional int32 uncertainty = 3;
   }
 `;
 const root = protobuf.parse(SCHEMA).root;
@@ -63,12 +63,13 @@ const FeedMessage = root.lookupType("transit_realtime.FeedMessage");
 
 const norm = s => (s || "").toLowerCase().replace(/street\b/g, "st").replace(/\s+/g, " ").trim();
 
+// ✅ Station mapping
 const STATION_TO_STOP_IDS = {
   // Clark St (2/3)
   "clark st": ["231N", "231S"],
   "clark street": ["231N", "231S"],
 
-  // High St (A/C) — A & C share the same stop_id base here
+  // High St (A/C) — High St uses A40* in static; C shows via routeId
   "high st": ["A40N", "A40S"],
   "high street": ["A40N", "A40S"]
 };
@@ -82,7 +83,7 @@ async function fetchFeed(path) {
     const r = await fetch(API_BASE + path, {
       headers: {
         "Accept": "application/x-protobuf",
-        "User-Agent": "mta-arrivals/1.4 (+vercel)"
+        "User-Agent": "mta-arrivals/1.6 (+vercel)"
       }
     });
     if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
@@ -94,6 +95,7 @@ async function fetchFeed(path) {
 }
 
 export default async function handler(req, res) {
+  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -102,23 +104,24 @@ export default async function handler(req, res) {
   try {
     const url = new URL(req.url, "http://localhost");
 
-    const stationRaw = url.searchParams.get("station");     // comma-separated ok
-    const stopIdsParam = url.searchParams.get("stop_ids");  // comma-separated ok
+    // Inputs
+    const stationRaw = url.searchParams.get("station");     // comma-separated
+    const stopIdsParam = url.searchParams.get("stop_ids");  // comma-separated
     const maxPerRoute = Math.max(1, Math.min(10, Number(url.searchParams.get("max_per_route") || 5)));
     const windowSeconds = Number(url.searchParams.get("window_seconds") || 0); // 0 = future-only
     const showDebug = url.searchParams.get("show_debug") === "1";
 
+    // Resolve stations -> stop_ids (support multiple stations)
     const stationsResolved = [];
     const unknownStations = [];
     const stopIdsSet = new Set();
-    const baseToStation = new Map();
+    const baseToStation = new Map(); // map base stop_id prefix to station name
 
     if (stationRaw) {
-      const names = stationRaw.split(",").map(s => s.trim()).filter(Boolean);
-      for (const name of names) {
+      for (const name of stationRaw.split(",").map(s => s.trim()).filter(Boolean)) {
         const key = norm(name);
         const mapped = STATION_TO_STOP_IDS[key];
-        if (mapped && mapped.length) {
+        if (mapped?.length) {
           stationsResolved.push(name);
           for (const id of mapped) {
             stopIdsSet.add(id);
@@ -133,42 +136,49 @@ export default async function handler(req, res) {
     if (stopIdsParam) {
       for (const id of stopIdsParam.split(",").map(s => s.trim()).filter(Boolean)) {
         stopIdsSet.add(id);
+        // if not in baseToStation, it will fall under "Unknown" group
       }
     }
 
     const stopIds = Array.from(stopIdsSet);
     if (!stopIds.length) {
       return res.status(400).json({
-        error: "No stop_ids resolved. Provide station=Clark St[,High St] and/or stop_ids=A41N,..."
+        error: "No stop_ids resolved. Provide station=Clark St[,High St] and/or stop_ids=A40N,..."
       });
     }
 
     const now = Math.floor(Date.now() / 1000);
-    let matchedNoTime = 0;
-    let matchedWithTime = 0;
+    let matchedNoTime = 0, matchedWithTime = 0;
+    let totalEntities = 0, totalTripUpdates = 0, totalStopTimeUpdates = 0;
 
-    let totalEntities = 0;
-    let totalTripUpdates = 0;
-    let totalStopTimeUpdates = 0;
     const sampleSet = new Set();
+    const matchedNoTimeSet = new Set();
+    const matchedNoTimeDetails = []; // ✅ capture detail for no-time matches
 
     const stationsObj = {};
 
     function pushArrival(sid, route, ts) {
+      // map sid back to a station display name via base prefix
       let stationName = "Unknown";
       for (const [base, name] of baseToStation.entries()) {
         if (sid.startsWith(base)) { stationName = name; break; }
       }
       const s = (stationsObj[stationName] ??= {});
       const r = (s[route] ??= []);
-      const in_min = Math.max(0, Math.round((ts - now) / 60));
-      r.push({ stop_id: sid, arrival_epoch: ts, in_min });
+      const entry = {
+        stop_id: sid,
+        arrival_epoch: ts ?? null,
+        in_min: ts == null ? null : Math.max(0, Math.round((ts - now) / 60))
+      };
+      if (ts == null) entry.status = "approaching";
+      r.push(entry);
     }
 
     function maybeAddSample(sid) {
       if (sampleSet.size < 50 && sid) sampleSet.add(sid);
     }
 
+    // Fetch feeds and collect matches
     for (const f of FEEDS) {
       const msg = await fetchFeed(f);
       if (!msg) continue;
@@ -184,31 +194,45 @@ export default async function handler(req, res) {
         for (const stu of tu.stopTimeUpdate || []) { // camelCase
           totalStopTimeUpdates++;
 
-          const sid = stu.stopId; // ✅ now populated (correct field number)
+          const sid = stu.stopId; // ✅ populated via correct schema
           maybeAddSample(sid);
 
           if (!prefixMatch(sid, stopIds)) continue;
 
+          const route = tu.trip?.routeId || "?";
           const ts = Number(stu.arrival?.time || stu.departure?.time || 0);
-          if (!ts) { matchedNoTime++; continue; }
 
+          if (!ts) {
+            matchedNoTime++;
+            matchedNoTimeSet.add(sid);
+            matchedNoTimeDetails.push({
+              stop_id: sid,
+              route,
+              arrival: stu.arrival || null,
+              departure: stu.departure || null
+            });
+            // surface as "approaching"
+            pushArrival(sid, route, null);
+            continue;
+          }
+
+          // Time filter
           if (windowSeconds === 0) {
-            if (ts < now) continue;          // future only
+            if (ts < now) continue;               // future only
           } else {
-            if (ts < now - windowSeconds) continue; // allow small lookback
+            if (ts < now - windowSeconds) continue; // allow slight lookback
           }
 
           matchedWithTime++;
-          const route = tu.trip?.routeId || "?";
           pushArrival(sid, route, ts);
         }
       }
     }
 
-    // Sort & trim for each station
+    // Sort & trim each station/route
     for (const [stationName, routes] of Object.entries(stationsObj)) {
       for (const [route, arrs] of Object.entries(routes)) {
-        arrs.sort((a, b) => a.arrival_epoch - b.arrival_epoch);
+        arrs.sort((a, b) => (a.arrival_epoch ?? Infinity) - (b.arrival_epoch ?? Infinity));
         routes[route] = arrs.slice(0, maxPerRoute);
       }
     }
@@ -232,7 +256,9 @@ export default async function handler(req, res) {
         total_entities: totalEntities,
         total_trip_updates: totalTripUpdates,
         total_stop_time_updates: totalStopTimeUpdates,
-        sample_stop_ids: Array.from(sampleSet)
+        sample_stop_ids: Array.from(sampleSet),
+        matched_no_time_ids: Array.from(matchedNoTimeSet),
+        matched_no_time_details: matchedNoTimeDetails
       };
     }
 
