@@ -1,7 +1,7 @@
 // Vercel Serverless Function: MTA GTFS-RT → JSON (no API key)
 // Grouped by station; multi-station; prefix stop_id match; rich debug; route+direction on every entry.
 // Adds fallback that treats epoch-like delay as time, and flags used_delay_as_time on entries.
-// Also includes expected empty routes per station so you can see missing lines.
+// Includes format=speech to return two next northbound trains per station.
 
 import protobuf from "protobufjs";
 
@@ -57,7 +57,7 @@ const STATION_TO_STOP_IDS = {
   "high street": ["A40N", "A40S"]
 };
 
-// Station → expected routes (so we can show empty lines explicitly)
+// Station → expected routes (so we can show empty lines explicitly in JSON)
 const STATION_EXPECTED_ROUTES = {
   "clark st": ["2", "3"],
   "clark street": ["2", "3"],
@@ -70,7 +70,7 @@ function prefixMatch(sid, ids) { return !!sid && ids.some(id => sid.startsWith(i
 async function fetchFeed(path) {
   try {
     const r = await fetch(API_BASE + path, {
-      headers: { "Accept": "application/x-protobuf", "User-Agent": "mta-arrivals/2.0 (+vercel)" }
+      headers: { "Accept": "application/x-protobuf", "User-Agent": "mta-arrivals/2.1 (+vercel)" }
     });
     if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
     const buf = new Uint8Array(await r.arrayBuffer());
@@ -105,6 +105,8 @@ export default async function handler(req, res) {
     const windowSeconds = Number(url.searchParams.get("window_seconds") || 0); // 0 = future-only
     const showDebug = url.searchParams.get("show_debug") === "1";
     const rawDump = url.searchParams.get("raw_dump") === "1";
+    const format = url.searchParams.get("format"); // "speech" to enable speech mode
+    const SPEECH_LIMIT = 2; // two next northbound per station
 
     // Resolve inputs
     const stationsResolved = [];
@@ -112,7 +114,7 @@ export default async function handler(req, res) {
     const stopIdsSet = new Set();
     const baseToStation = new Map();
 
-    // Also track expected routes per resolved station
+    // Expected routes (for JSON display)
     const expectedRoutesByStation = {};
 
     if (stationRaw) {
@@ -149,12 +151,10 @@ export default async function handler(req, res) {
     // station -> route -> [arrivals]
     const stationsObj = {};
 
-    // Seed expected empty routes so you see missing lines explicitly
+    // Seed expected empty routes so JSON explicitly shows missing lines
     for (const [stationName, routes] of Object.entries(expectedRoutesByStation)) {
       const s = (stationsObj[stationName] ??= {});
-      for (const r of routes) {
-        if (!s[r]) s[r] = [];
-      }
+      for (const r of routes) if (!s[r]) s[r] = [];
     }
 
     function pushArrival(sid, route, ts, entry) {
@@ -164,11 +164,10 @@ export default async function handler(req, res) {
       }
       const s = (stationsObj[stationName] ??= {});
       const r = (s[route] ??= []);
-
       const final = entry || {
         stop_id: sid,
-        route,                         // <-- always include route on the entry
-        direction: dirFromStopId(sid), // <-- "N" or "S"
+        route,
+        direction: dirFromStopId(sid),
         arrival_epoch: ts,
         in_min: Math.max(0, Math.round((ts - now) / 60))
       };
@@ -253,10 +252,8 @@ export default async function handler(req, res) {
               in_min: null,
               status: "approaching"
             };
-            // keep raw delay seconds if present (debug/optional UI)
             const delaySec = (aDelay ?? dDelay ?? null);
             if (delaySec != null) entry.delay_seconds = delaySec;
-
             pushArrival(sid, route, null, entry);
             continue;
           }
@@ -291,43 +288,81 @@ export default async function handler(req, res) {
       }
     }
 
-    // Ensure expected empty routes exist (in case station provided only via stop_ids without "station=")
-    if (!stationRaw && stopIds.length) {
-      // best-effort: if the user passed stop_ids but they correspond to known stations,
-      // we already seeded above when stationRaw existed. If not, we leave as-is.
-    }
-
-    const payload = {
-      meta: {
-        stations: stationsResolved.length ? stationsResolved : null,
-        unknown_stations: unknownStations.length ? unknownStations : null,
-        stop_ids: stopIds,
-        generated_at: now,
-        max_per_route: maxPerRoute,
-        window_seconds: windowSeconds,
-        expected_routes: stationsResolved.reduce((acc, name) => {
-          acc[name] = expectedRoutesByStation[name] || null;
-          return acc;
-        }, {})
-      },
-      stations: stationsObj
+    // Build payload
+    const meta = {
+      stations: stationsResolved.length ? stationsResolved : null,
+      unknown_stations: unknownStations.length ? unknownStations : null,
+      stop_ids: stopIds,
+      generated_at: Math.floor(Date.now() / 1000),
+      max_per_route: maxPerRoute,
+      window_seconds: windowSeconds,
+      expected_routes: stationsResolved.reduce((acc, name) => {
+        acc[name] = expectedRoutesByStation[name] || null;
+        return acc;
+      }, {})
     };
 
+    // If format=speech, return two next northbound per station
+    if (format === "speech") {
+      function fmtMinutes(n) {
+        if (n == null) return "approaching";
+        if (n <= 0) return "now";
+        if (n === 1) return "1 minute";
+        return `${n} minutes`;
+      }
+
+      const perStationSentences = {};
+      for (const [stationName, routes] of Object.entries(stationsObj)) {
+        // collect northbound (direction "N") across all routes, then sort by time
+        const northbound = [];
+        for (const [routeId, arrs] of Object.entries(routes)) {
+          for (const a of arrs) {
+            if (a.direction === "N") {
+              northbound.push({ route: routeId, in_min: a.in_min, arrival_epoch: a.arrival_epoch });
+            }
+          }
+        }
+        northbound.sort((x, y) => (x.arrival_epoch ?? Infinity) - (y.arrival_epoch ?? Infinity));
+        const top = northbound.slice(0, SPEECH_LIMIT);
+
+        let sentence;
+        if (!top.length) {
+          sentence = `${stationName}: no northbound trains listed.`;
+        } else {
+          const bits = top.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`);
+          sentence = `${stationName}: ${bits.join("; ")}.`;
+        }
+        perStationSentences[stationName] = sentence;
+      }
+
+      // Join in the order the user requested stations
+      const ordered = (stationsResolved.length ? stationsResolved : Object.keys(perStationSentences));
+      const speech = ordered.map(n => perStationSentences[n]).filter(Boolean).join(" ");
+
+      const speechPayload = { meta, speech, stations_speech: perStationSentences };
+      if (showDebug) {
+        // include a small debug summary in speech mode
+        speechPayload.debug = {
+          matched_no_time, matched_with_time, used_delay_as_time_count,
+          total_entities, total_trip_updates, total_stop_time_updates
+        };
+      }
+      res.setHeader("Cache-Control", "s-maxage=15, stale-while-revalidate=30");
+      return res.status(200).json(speechPayload);
+    }
+
+    // Default JSON (non-speech)
+    const payload = { meta, stations: stationsObj };
     if (showDebug) {
       for (const id of stopIds) sampleSet.add(id);
       payload.debug = {
-        matched_no_time: matchedNoTime,
-        matched_with_time: matchedWithTime,
-        used_delay_as_time_count: usedDelayAsTimeCount,
-        total_entities: totalEntities,
-        total_trip_updates: totalTripUpdates,
-        total_stop_time_updates: totalStopTimeUpdates,
+        matched_no_time, matched_with_time, used_delay_as_time_count,
+        total_entities, total_trip_updates, total_stop_time_updates,
         sample_stop_ids: Array.from(sampleSet),
         matched_no_time_ids: Array.from(matchedNoTimeSet),
         matched_no_time_details: matchedNoTimeDetails
       };
     }
-
     res.setHeader("Cache-Control", "s-maxage=15, stale-while-revalidate=30");
     return res.status(200).json(payload);
 
