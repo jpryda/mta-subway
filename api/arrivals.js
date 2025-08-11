@@ -1,5 +1,5 @@
 // Vercel Serverless Function: MTA GTFS-RT → JSON (no API key)
-// Grouped by station name; camelCase fixes; prefix stop_id match; time window + debug
+// Grouped by station name; with debug counters + sample stop_ids for mapping verification
 
 import protobuf from "protobufjs";
 
@@ -16,7 +16,6 @@ const FEEDS = [
 ];
 const API_BASE = "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/";
 
-// Minimal GTFS-RT schema (proto2), parsed in-memory
 const SCHEMA = `
   syntax = "proto2";
   package transit_realtime;
@@ -31,7 +30,6 @@ const SCHEMA = `
 const root = protobuf.parse(SCHEMA).root;
 const FeedMessage = root.lookupType("transit_realtime.FeedMessage");
 
-// Utilities
 const norm = s => (s || "").toLowerCase().replace(/street\b/g, "st").replace(/\s+/g, " ").trim();
 
 const STATION_TO_STOP_IDS = {
@@ -52,19 +50,18 @@ async function fetchFeed(path) {
     const r = await fetch(API_BASE + path, {
       headers: {
         "Accept": "application/x-protobuf",
-        "User-Agent": "mta-arrivals/1.2 (+vercel)"
+        "User-Agent": "mta-arrivals/1.3 (+vercel)"
       }
     });
     if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
     const buf = new Uint8Array(await r.arrayBuffer());
     return FeedMessage.decode(buf);
   } catch {
-    return null; // tolerate transient non-protobuf responses
+    return null;
   }
 }
 
 export default async function handler(req, res) {
-  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -73,19 +70,15 @@ export default async function handler(req, res) {
   try {
     const url = new URL(req.url, "http://localhost");
 
-    // Inputs
-    const stationRaw = url.searchParams.get("station");     // may be comma-separated
-    const stopIdsParam = url.searchParams.get("stop_ids");  // may be comma-separated
+    const stationRaw = url.searchParams.get("station");
+    const stopIdsParam = url.searchParams.get("stop_ids");
     const maxPerRoute = Math.max(1, Math.min(10, Number(url.searchParams.get("max_per_route") || 5)));
-    const windowSeconds = Number(url.searchParams.get("window_seconds") || 0); // 0=future-only
+    const windowSeconds = Number(url.searchParams.get("window_seconds") || 0);
     const showDebug = url.searchParams.get("show_debug") === "1";
 
-    // Resolve stations -> stop_ids (support multiple stations)
     const stationsResolved = [];
     const unknownStations = [];
     const stopIdsSet = new Set();
-
-    // Map base stop_id prefix -> station display name for grouping
     const baseToStation = new Map();
 
     if (stationRaw) {
@@ -97,7 +90,7 @@ export default async function handler(req, res) {
           stationsResolved.push(name);
           for (const id of mapped) {
             stopIdsSet.add(id);
-            baseToStation.set(id, name); // remember which station contributed this base id
+            baseToStation.set(id, name);
           }
         } else {
           unknownStations.push(name);
@@ -108,7 +101,6 @@ export default async function handler(req, res) {
     if (stopIdsParam) {
       for (const id of stopIdsParam.split(",").map(s => s.trim()).filter(Boolean)) {
         stopIdsSet.add(id);
-        // if not already mapped to a station, leave unmapped; will appear under "Unknown" group
       }
     }
 
@@ -123,13 +115,14 @@ export default async function handler(req, res) {
     let matchedNoTime = 0;
     let matchedWithTime = 0;
 
-    // stations -> routes -> arrivals[]
+    let totalEntities = 0;
+    let totalTripUpdates = 0;
+    let totalStopTimeUpdates = 0;
+    const sampleSet = new Set();
+
     const stationsObj = {};
 
-    // Helper to place an arrival into the correct station+route bucket
     function pushArrival(sid, route, ts) {
-      // Figure out which station this sid belongs to by prefix against our base ids
-      // Prefer explicit station mapping; else fallback to "Unknown"
       let stationName = "Unknown";
       for (const [base, name] of baseToStation.entries()) {
         if (sid.startsWith(base)) { stationName = name; break; }
@@ -140,25 +133,33 @@ export default async function handler(req, res) {
       r.push({ stop_id: sid, arrival_epoch: ts, in_min });
     }
 
-    // Fetch feeds and collect matches
+    function maybeAddSample(sid) {
+      if (sampleSet.size < 50 && sid) sampleSet.add(sid);
+    }
+
     for (const f of FEEDS) {
       const msg = await fetchFeed(f);
       if (!msg) continue;
+
+      totalEntities += msg.entity.length;
 
       for (const e of msg.entity) {
         const tu = e.tripUpdate;
         if (!tu) continue;
 
-        const route = tu.trip?.routeId || "?";
+        totalTripUpdates++;
 
         for (const stu of tu.stopTimeUpdate || []) {
+          totalStopTimeUpdates++;
+
           const sid = stu.stopId;
+          maybeAddSample(sid);
+
           if (!prefixMatch(sid, stopIds)) continue;
 
           const ts = Number(stu.arrival?.time || stu.departure?.time || 0);
           if (!ts) { matchedNoTime++; continue; }
 
-          // Time filter: future-only if windowSeconds==0, else allow slight past
           if (windowSeconds === 0) {
             if (ts < now) continue;
           } else {
@@ -166,12 +167,12 @@ export default async function handler(req, res) {
           }
 
           matchedWithTime++;
+          const route = tu.trip?.routeId || "?";
           pushArrival(sid, route, ts);
         }
       }
     }
 
-    // Sort and trim each station's routes
     for (const [stationName, routes] of Object.entries(stationsObj)) {
       for (const [route, arrs] of Object.entries(routes)) {
         arrs.sort((a, b) => a.arrival_epoch - b.arrival_epoch);
@@ -188,13 +189,17 @@ export default async function handler(req, res) {
         max_per_route: maxPerRoute,
         window_seconds: windowSeconds
       },
-      stations: stationsObj // <-- grouped by station name
+      stations: stationsObj
     };
 
     if (showDebug) {
       payload.debug = {
         matched_no_time: matchedNoTime,
-        matched_with_time: matchedWithTime
+        matched_with_time: matchedWithTime,
+        total_entities: totalEntities,
+        total_trip_updates: totalTripUpdates,
+        total_stop_time_updates: totalStopTimeUpdates,
+        sample_stop_ids: Array.from(sampleSet)
       };
     }
 
@@ -205,4 +210,3 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: err?.message || "server error" });
   }
 }
-
