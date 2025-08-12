@@ -47,10 +47,10 @@ const prefixMatch = (sid, ids) => !!sid && ids.some(id => sid.startsWith(id));
 
 // Example station maps (extend as needed)
 const STATION_TO_STOP_IDS = {
-  "clark st": ["231N", "231S"],
-  "clark street": ["231N", "231S"],
-  "high st": ["A40N", "A40S"],
-  "high street": ["A40N", "A40S"],
+  "clark st": ["231"],
+  "clark street": ["231"],
+  "high st": ["A40"],
+  "high street": ["A40"],
 };
 const STATION_EXPECTED_ROUTES = {
   "clark st": ["2", "3"],
