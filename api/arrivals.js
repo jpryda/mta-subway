@@ -1,7 +1,7 @@
 // Vercel Serverless Function: MTA GTFS-RT → JSON (no API key)
 // Grouped by station; multi-station; prefix stop_id match; rich debug; route+direction on every entry.
-// Adds fallback that treats epoch-like delay as time, and flags used_delay_as_time on entries.
-// Includes format=speech to return two next northbound trains per station.
+// Fallback for feeds that put epoch in delay; flags used_delay_as_time on entries.
+// format=speech supports speech_limit (default 2) and speech_direction=N|S|both.
 
 import protobuf from "protobufjs";
 
@@ -13,7 +13,7 @@ const FEEDS = [
   "nyct%2Fgtfs-l",
   "nyct%2Fgtfs-nqrw",
   "nyct%2Fgtfs-7",
-  "nyct%2Fgtfs",     // 1/2/3/4/5/6
+  "nyct%2Fgtfs",
   "nyct%2Fgtfs-si"
 ];
 
@@ -57,7 +57,7 @@ const STATION_TO_STOP_IDS = {
   "high street": ["A40N", "A40S"]
 };
 
-// Station → expected routes (so we can show empty lines explicitly in JSON)
+// Station → expected routes (for JSON display)
 const STATION_EXPECTED_ROUTES = {
   "clark st": ["2", "3"],
   "clark street": ["2", "3"],
@@ -70,7 +70,7 @@ function prefixMatch(sid, ids) { return !!sid && ids.some(id => sid.startsWith(i
 async function fetchFeed(path) {
   try {
     const r = await fetch(API_BASE + path, {
-      headers: { "Accept": "application/x-protobuf", "User-Agent": "mta-arrivals/2.1 (+vercel)" }
+      headers: { "Accept": "application/x-protobuf", "User-Agent": "mta-arrivals/2.2 (+vercel)" }
     });
     if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
     const buf = new Uint8Array(await r.arrayBuffer());
@@ -102,45 +102,18 @@ export default async function handler(req, res) {
     const stationRaw = url.searchParams.get("station");
     const stopIdsParam = url.searchParams.get("stop_ids");
     const maxPerRoute = Math.max(1, Math.min(10, Number(url.searchParams.get("max_per_route") || 5)));
-    const lookbackSeconds = Number(url.searchParams.get("lookback_seconds") || 0); // 0 = future-only
+    const windowSeconds = Number(url.searchParams.get("window_seconds") || 0); // default: future-only
     const showDebug = url.searchParams.get("show_debug") === "1";
     const rawDump = url.searchParams.get("raw_dump") === "1";
     const format = url.searchParams.get("format"); // "speech" to enable speech mode
-
-    // Read parameters
     const speechLimit = Math.max(1, Number(url.searchParams.get("speech_limit") || 2));
-    const speechDirection = (url.searchParams.get("speech_direction") || "N").toUpperCase();
-
-    // Function to check if a stop_id matches desired direction
-    function matchesDirection(stopId) {
-      if (speechDirection === "BOTH") return true;
-      return stopId.endsWith(speechDirection);
-    }
-
-    // When building speech text
-    for (const [stationName, routes] of Object.entries(stationsOut)) {
-      speechParts.push(`${stationName}:`);
-
-      for (const [route, arrivals] of Object.entries(routes)) {
-        const filtered = arrivals.filter(a => matchesDirection(a.stop_id));
-
-        const top = filtered.slice(0, speechLimit);
-        if (top.length === 0) {
-          speechParts.push(`  No upcoming ${speechDirection === "BOTH" ? "" : (speechDirection === "N" ? "northbound" : "southbound")} ${route} trains.`);
-        } else {
-          const times = top.map(a => `${a.in_min} min`).join(", ");
-          speechParts.push(`  ${route}: ${times}`);
-        }
-      }
-    }
+    const speechDirection = (url.searchParams.get("speech_direction") || "N").toUpperCase(); // N|S|BOTH
 
     // Resolve inputs
     const stationsResolved = [];
     const unknownStations = [];
     const stopIdsSet = new Set();
     const baseToStation = new Map();
-
-    // Expected routes (for JSON display)
     const expectedRoutesByStation = {};
 
     if (stationRaw) {
@@ -177,7 +150,7 @@ export default async function handler(req, res) {
     // station -> route -> [arrivals]
     const stationsObj = {};
 
-    // Seed expected empty routes so JSON explicitly shows missing lines
+    // Seed expected empty routes for JSON
     for (const [stationName, routes] of Object.entries(expectedRoutesByStation)) {
       const s = (stationsObj[stationName] ??= {});
       for (const r of routes) if (!s[r]) s[r] = [];
@@ -285,10 +258,10 @@ export default async function handler(req, res) {
           }
 
           // Time filter
-          if (lookbackSeconds === 0) {
+          if (windowSeconds === 0) {
             if (ts < now) continue;
           } else {
-            if (ts < now - lookbackSeconds) continue;
+            if (ts < now - windowSeconds) continue;
           }
 
           matchedWithTime++;
@@ -306,7 +279,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // Sort & trim
+    // Sort & trim JSON arrays
     for (const [stationName, routes] of Object.entries(stationsObj)) {
       for (const [route, arrs] of Object.entries(routes)) {
         arrs.sort((a, b) => (a.arrival_epoch ?? Infinity) - (b.arrival_epoch ?? Infinity));
@@ -314,21 +287,20 @@ export default async function handler(req, res) {
       }
     }
 
-    // Build payload
     const meta = {
       stations: stationsResolved.length ? stationsResolved : null,
       unknown_stations: unknownStations.length ? unknownStations : null,
       stop_ids: stopIds,
       generated_at: Math.floor(Date.now() / 1000),
       max_per_route: maxPerRoute,
-      lookback_seconds: lookbackSeconds,
+      window_seconds: windowSeconds,
       expected_routes: stationsResolved.reduce((acc, name) => {
         acc[name] = expectedRoutesByStation[name] || null;
         return acc;
       }, {})
     };
 
-    // If format=speech, return two next northbound per station
+    // ---- Speech mode ----
     if (format === "speech") {
       function fmtMinutes(n) {
         if (n == null) return "approaching";
@@ -336,38 +308,58 @@ export default async function handler(req, res) {
         if (n === 1) return "1 minute";
         return `${n} minutes`;
       }
+      function dirLabel(code) {
+        if (code === "N") return "northbound";
+        if (code === "S") return "southbound";
+        return "";
+      }
+      function matchesDirection(entry) {
+        if (speechDirection === "BOTH") return true;
+        return entry.direction === speechDirection;
+      }
 
       const perStationSentences = {};
       for (const [stationName, routes] of Object.entries(stationsObj)) {
-        // collect northbound (direction "N") across all routes, then sort by time
-        const northbound = [];
+        // Collect arrivals across all routes
+        const all = [];
         for (const [routeId, arrs] of Object.entries(routes)) {
-          for (const a of arrs) {
-            if (a.direction === "N") {
-              northbound.push({ route: routeId, in_min: a.in_min, arrival_epoch: a.arrival_epoch });
-            }
-          }
+          for (const a of arrs) all.push({ route: routeId, ...a });
         }
-        northbound.sort((x, y) => (x.arrival_epoch ?? Infinity) - (y.arrival_epoch ?? Infinity));
-        const top = northbound.slice(0, speechLimit);
+        // Filter by direction
+        const north = all.filter(a => a.direction === "N").sort((x, y) => (x.arrival_epoch ?? Infinity) - (y.arrival_epoch ?? Infinity));
+        const south = all.filter(a => a.direction === "S").sort((x, y) => (x.arrival_epoch ?? Infinity) - (y.arrival_epoch ?? Infinity));
 
-        let sentence;
-        if (!top.length) {
-          sentence = `${stationName}: no northbound trains listed.`;
-        } else {
-          const bits = top.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`);
-          sentence = `${stationName}: ${bits.join("; ")}.`;
+        let sentence = `${stationName}: `;
+        if (speechDirection === "N") {
+          const top = north.slice(0, speechLimit);
+          sentence += top.length
+            ? top.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`).join("; ") + "."
+            : "no northbound trains listed.";
+        } else if (speechDirection === "S") {
+          const top = south.slice(0, speechLimit);
+          sentence += top.length
+            ? top.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`).join("; ") + "."
+            : "no southbound trains listed.";
+        } else { // BOTH
+          const nTop = north.slice(0, speechLimit);
+          const sTop = south.slice(0, speechLimit);
+          const parts = [];
+          parts.push(nTop.length
+            ? `northbound: ${nTop.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`).join("; ")}`
+            : "northbound: none");
+          parts.push(sTop.length
+            ? `southbound: ${sTop.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`).join("; ")}`
+            : "southbound: none");
+          sentence += parts.join(". ") + ".";
         }
         perStationSentences[stationName] = sentence;
       }
 
-      // Join in the order the user requested stations
       const ordered = (stationsResolved.length ? stationsResolved : Object.keys(perStationSentences));
       const speech = ordered.map(n => perStationSentences[n]).filter(Boolean).join(" ");
 
       const speechPayload = { meta, speech, stations_speech: perStationSentences };
       if (showDebug) {
-        // include a small debug summary in speech mode
         speechPayload.debug = {
           matched_no_time, matched_with_time, used_delay_as_time_count,
           total_entities, total_trip_updates, total_stop_time_updates
@@ -376,6 +368,7 @@ export default async function handler(req, res) {
       res.setHeader("Cache-Control", "s-maxage=15, stale-while-revalidate=30");
       return res.status(200).json(speechPayload);
     }
+    // ---- End speech mode ----
 
     // Default JSON (non-speech)
     const payload = { meta, stations: stationsObj };
