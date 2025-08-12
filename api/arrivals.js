@@ -6,6 +6,8 @@
 // - Debug: show_debug=1 (with optional raw_dump=1) returns interpreter details.
 
 import protobuf from "protobufjs";
+// Load name→base stop_id[] index (minified JSON) and normalize keys once
+import stationIndexRaw from "../data/station_index.min.json" assert { type: "json" };
 
 const FEEDS = [
   "nyct%2Fgtfs-ace",
@@ -46,14 +48,13 @@ const dirFromStopId = sid => (sid && /[NS]$/.test(sid) ? sid.slice(-1) : null);
 const asIso = sec => (sec == null ? null : new Date(Number(sec) * 1000).toISOString());
 const prefixMatch = (sid, ids) => !!sid && ids.some(id => sid.startsWith(id));
 
-// Station map (keys are station names; values are base stop_ids WITHOUT N/S suffix)
-// Populate this with your prebuilt name→base-stop_id map.
-const STATION_TO_STOP_IDS = {
-  "clark st": ["231"],
-  "clark street": ["231"],
-  "high st": ["A40"],
-  "high street": ["A40"],
-};
+// Build normalized index: Map<normalizedStationName, string[] of base stop_ids>
+const STATION_INDEX = new Map(
+  Object.entries(stationIndexRaw).map(([k, v]) => [
+    norm(k),
+    (Array.isArray(v) ? v : [v]).map(String)
+  ])
+);
 
 async function fetchFeed(path) {
   try {
@@ -97,13 +98,13 @@ function parseQuery(req) {
 function resolveStops(stationRaw, stopIdsParam) {
   const stationsResolved = [];
   const unknownStations = [];
-  const stopIdsSet = new Set();
-  const baseToStation = new Map();
+  const stopIdsSet = new Set();     // base stop_ids (no N/S)
+  const baseToStation = new Map();  // base stop_id -> display name (per-request inverse)
 
   if (stationRaw) {
     for (const name of stationRaw.split(",").map(s => s.trim()).filter(Boolean)) {
       const key = norm(name);
-      const mapped = STATION_TO_STOP_IDS[key];
+      const mapped = STATION_INDEX.get(key);
       if (mapped?.length) {
         stationsResolved.push(name);
         for (const id of mapped) { stopIdsSet.add(id); baseToStation.set(id, name); }
@@ -113,7 +114,11 @@ function resolveStops(stationRaw, stopIdsParam) {
     }
   }
 
-  if (stopIdsParam) for (const id of stopIdsParam.split(",").map(s => s.trim()).filter(Boolean)) stopIdsSet.add(id);
+  if (stopIdsParam) {
+    for (const id of stopIdsParam.split(",").map(s => s.trim()).filter(Boolean)) {
+      stopIdsSet.add(id);
+    }
+  }
 
   return { stationsResolved, unknownStations, stopIds: Array.from(stopIdsSet), baseToStation };
 }
@@ -139,8 +144,10 @@ function getTimes(stu) {
 }
 
 function pushArrival(stationsObj, baseToStation, sid, route, now, ts, extra = {}) {
-  let stationName = "Unknown";
-  for (const [base, name] of baseToStation.entries()) if (sid.startsWith(base)) { stationName = name; break; }
+  // O(1) station lookup using base stop_id
+  const base = sid?.replace(/[NS]$/, "") || sid;   // "101N" -> "101"
+  const stationName = baseToStation.get(base) || "Unknown";
+
   const s = (stationsObj[stationName] ??= {});
   const r = (s[route] ??= []);
   r.push({
@@ -148,7 +155,7 @@ function pushArrival(stationsObj, baseToStation, sid, route, now, ts, extra = {}
     route,
     direction: dirFromStopId(sid),
     arrival_epoch: ts,
-    in_min: ts == null ? null : Math.max(0, Math.floor((ts - now) / 60)), // Round down to nearest minute to be conservative
+    in_min: ts == null ? null : Math.max(0, Math.floor((ts - now) / 60)), // floor to be conservative
     ...extra
   });
 }
@@ -192,7 +199,9 @@ export default async function handler(req, res) {
       resolveStops(q.stationRaw, q.stopIdsParam);
 
     if (!stopIds.length) {
-      return res.status(400).json({ error: "No stop_ids resolved. Provide station=Clark St[,High St] and/or stop_ids=A40N,..." });
+      return res.status(400).json({
+        error: "No stop_ids resolved. Provide station=Van Cortlandt Park-242 St[,High St] and/or stop_ids=A40N,..."
+      });
     }
 
     const now = Math.floor(Date.now() / 1000); // Unix time integer
