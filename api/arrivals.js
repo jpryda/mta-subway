@@ -146,7 +146,7 @@ function pushArrival(stationsObj, baseToStation, sid, route, now, ts, extra = {}
     route,
     direction: dirFromStopId(sid),
     arrival_epoch: ts,
-    in_min: ts == null ? null : Math.max(0, Math.round((ts - now) / 60)),
+    in_min: ts == null ? null : Math.max(0, Math.floor((ts - now) / 60)), // Round down to nearest minute to be conservative
     ...extra
   });
 }
@@ -200,7 +200,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "No stop_ids resolved. Provide station=Clark St[,High St] and/or stop_ids=A40N,..." });
     }
 
-    const now = Math.floor(Date.now() / 1000);
+    const now = Math.floor(Date.now() / 1000); // Unix time integer
     const stats = { matchedNoTime: 0, matchedWithTime: 0, usedDelayAsTimeCount: 0, totalEntities: 0, totalTripUpdates: 0, totalStopTimeUpdates: 0 };
     const sampleSet = new Set(stopIds);
     const matchedNoTimeSet = new Set();
