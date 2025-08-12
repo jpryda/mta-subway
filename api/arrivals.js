@@ -80,14 +80,14 @@ function parseQuery(req) {
   const stationRaw = qp("station");
   const stopIdsParam = qp("stop_ids");
   const maxPerRoute = Math.max(1, Math.min(10, num("max_per_route", 5)));
-  const windowSeconds = num("window_seconds", 0); // 0=future-only
+  const lookbackSeconds = num("lookback_seconds", 0); // 0=future-only
   const showDebug = bool("show_debug");
   const rawDump = bool("raw_dump");
   const format = qp("format"); // "speech" optional
   const speechLimit = Math.max(1, num("speech_limit", 2));
   const speechDirection = (qp("speech_direction") || "N").toUpperCase(); // N|S|BOTH
 
-  return { stationRaw, stopIdsParam, maxPerRoute, windowSeconds, showDebug, rawDump, format, speechLimit, speechDirection };
+  return { stationRaw, stopIdsParam, maxPerRoute, lookbackSeconds, showDebug, rawDump, format, speechLimit, speechDirection };
 }
 
 function resolveStops(stationRaw, stopIdsParam) {
@@ -259,7 +259,7 @@ export default async function handler(req, res) {
           }
 
           // Time window filter
-          if ((q.windowSeconds === 0 && ts < now) || (q.windowSeconds > 0 && ts < now - q.windowSeconds)) continue;
+          if ((q.lookbackSeconds === 0 && ts < now) || (q.lookbackSeconds > 0 && ts < now - q.lookbackSeconds)) continue;
 
           stats.matchedWithTime++;
           if (usedDelayAsTime) stats.usedDelayAsTimeCount++;
@@ -279,7 +279,7 @@ export default async function handler(req, res) {
       stop_ids: stopIds,
       generated_at: now,
       max_per_route: q.maxPerRoute,
-      window_seconds: q.windowSeconds,
+      lookback_seconds: q.lookbackSeconds,
       expected_routes: stationsResolved.reduce((acc, name) => { acc[name] = expectedRoutesByStation[name] || null; return acc; }, {})
     };
 
