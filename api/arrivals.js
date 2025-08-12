@@ -1,7 +1,7 @@
 // Vercel Serverless Function: MTA GTFS-RT → JSON (no API key)
 // - Grouped by station; multi-station; prefix stop_id match.
 // - format=speech supports speech_limit (default 2) and speech_direction=N|S|BOTH.
-// - Optional heuristic: treat_delay_as_epoch=1 will treat large `delay` values as epoch seconds (for buggy feeds).
+// - Epoch-in-delay fallback is ALWAYS ON (treatDelayAsEpoch = true).
 // - Debug: show_debug=1 (with optional raw_dump=1) returns interpreter details.
 
 import protobuf from "protobufjs";
@@ -19,6 +19,7 @@ const FEEDS = [
 ];
 const API_BASE = "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/";
 const EPOCH_GUESS_THRESHOLD = 1104537600; // 2005-01-01
+const TREAT_DELAY_AS_EPOCH = true;        // <-- hardcoded ON
 
 // Minimal GTFS-RT schema (TripUpdate + StopTimeUpdate + Event)
 const SCHEMA = `
@@ -61,7 +62,7 @@ const STATION_EXPECTED_ROUTES = {
 async function fetchFeed(path) {
   try {
     const r = await fetch(API_BASE + path, {
-      headers: { "Accept": "application/x-protobuf", "User-Agent": "mta-arrivals/2.3 (+vercel)" }
+      headers: { "Accept": "application/x-protobuf", "User-Agent": "mta-arrivals/2.4 (+vercel)" }
     });
     if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
     return FeedMessage.decode(new Uint8Array(await r.arrayBuffer()));
@@ -85,9 +86,8 @@ function parseQuery(req) {
   const format = qp("format"); // "speech" optional
   const speechLimit = Math.max(1, num("speech_limit", 2));
   const speechDirection = (qp("speech_direction") || "N").toUpperCase(); // N|S|BOTH
-  const treatDelayAsEpoch = (qp("treat_delay_as_epoch") !== "0"); // default ON, pass ...=0 to disable
 
-  return { stationRaw, stopIdsParam, maxPerRoute, windowSeconds, showDebug, rawDump, format, speechLimit, speechDirection, treatDelayAsEpoch };
+  return { stationRaw, stopIdsParam, maxPerRoute, windowSeconds, showDebug, rawDump, format, speechLimit, speechDirection };
 }
 
 function resolveStops(stationRaw, stopIdsParam) {
@@ -116,7 +116,7 @@ function resolveStops(stationRaw, stopIdsParam) {
   return { stationsResolved, unknownStations, stopIds: Array.from(stopIdsSet), baseToStation, expectedRoutesByStation };
 }
 
-function getTimes(stu, { treatDelayAsEpoch }) {
+function getTimes(stu) {
   const aTime = stu.arrival?.time ?? null;
   const dTime = stu.departure?.time ?? null;
   const aDelay = stu.arrival?.delay ?? null;
@@ -126,7 +126,7 @@ function getTimes(stu, { treatDelayAsEpoch }) {
   let ts = Number(aTime || dTime || 0);
   let usedDelayAsTime = false;
 
-  if (!ts && treatDelayAsEpoch) {
+  if (!ts && TREAT_DELAY_AS_EPOCH) {
     const candidates = [aDelay, dDelay].filter(v => v != null);
     const epochLike = candidates.find(v => Number(v) > EPOCH_GUESS_THRESHOLD);
     if (epochLike) { ts = Number(epochLike); usedDelayAsTime = true; }
@@ -166,6 +166,23 @@ function sortAndTrim(stationsObj, maxPerRoute) {
     }
   }
 }
+
+// Speech helpers
+const sayArrival = (t) => {
+  if (t.in_min == null) return `${t.route} is approaching`;
+  if (t.in_min <= 0)   return `${t.route} is arriving now`;
+  if (t.in_min === 1)  return `${t.route} in 1 minute`;
+  return `${t.route} in ${t.in_min} minutes`;
+};
+const dedupeSpeech = (arr) => {
+  const seen = new Set();
+  return arr.filter(a => {
+    const key = `${a.route}|${a.direction}|${a.in_min ?? "approach"}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+};
 
 export default async function handler(req, res) {
   // CORS
@@ -210,7 +227,7 @@ export default async function handler(req, res) {
           if (!prefixMatch(sid, stopIds)) continue;
           sampleSet.add(sid);
 
-          const { ts, usedDelayAsTime, delaySeconds, aTime, dTime, aDelay, dDelay } = getTimes(stu, q);
+          const { ts, usedDelayAsTime, delaySeconds, aTime, dTime, aDelay, dDelay } = getTimes(stu);
 
           if (!ts) {
             stats.matchedNoTime++;
@@ -268,25 +285,38 @@ export default async function handler(req, res) {
 
     // ---- Speech mode ----
     if (q.format === "speech") {
-      const fmtMinutes = n => (n == null ? "approaching" : n <= 0 ? "now" : n === 1 ? "1 minute" : `${n} minutes`);
       const perStationSentences = {};
-
       for (const [stationName, routes] of Object.entries(stationsObj)) {
-        const all = Object.entries(routes).flatMap(([routeId, arrs]) => arrs.map(a => ({ route: routeId, ...a })));
-        const byDir = d => all.filter(a => a.direction === d).sort((x, y) => (x.arrival_epoch ?? Infinity) - (y.arrival_epoch ?? Infinity));
+        // Flatten and keep route id on each entry
+        const all = Object.entries(routes).flatMap(([routeId, arrs]) => arrs.map(a => ({ ...a, route: routeId })));
+
+        // Build per-direction lists, dedup and sort by ETA (approaching at end due to Infinity)
+        const byDir = d => dedupeSpeech(
+          all.filter(a => a.direction === d)
+        ).sort((x, y) => (x.arrival_epoch ?? Infinity) - (y.arrival_epoch ?? Infinity));
+
         const north = byDir("N").slice(0, q.speechLimit);
         const south = byDir("S").slice(0, q.speechLimit);
 
         let sentence = `${stationName}: `;
         if (q.speechDirection === "N") {
-          sentence += north.length ? `(northbound) ${north.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`).join("; ")}.` : "(northbound) none.";
+          sentence += north.length
+            ? `(northbound) ${north.map(sayArrival).join("; ")}.`
+            : "(northbound) none.";
         } else if (q.speechDirection === "S") {
-          sentence += south.length ? `(southbound) ${south.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`).join("; ")}.` : "(southbound) none.";
+          sentence += south.length
+            ? `(southbound) ${south.map(sayArrival).join("; ")}.`
+            : "(southbound) none.";
         } else {
-          const nPart = north.length ? `(northbound) ${north.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`).join("; ")}` : "(northbound) none";
-          const sPart = south.length ? `(southbound) ${south.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`).join("; ")}` : "(southbound) none";
+          const nPart = north.length
+            ? `(northbound) ${north.map(sayArrival).join("; ")}`
+            : "(northbound) none";
+          const sPart = south.length
+            ? `(southbound) ${south.map(sayArrival).join("; ")}`
+            : "(southbound) none";
           sentence += `${nPart}. ${sPart}.`;
         }
+
         perStationSentences[stationName] = sentence;
       }
 
