@@ -85,7 +85,7 @@ function parseQuery(req) {
   const format = qp("format"); // "speech" optional
   const speechLimit = Math.max(1, num("speech_limit", 2));
   const speechDirection = (qp("speech_direction") || "N").toUpperCase(); // N|S|BOTH
-  const treatDelayAsEpoch = bool("treat_delay_as_epoch");
+  const treatDelayAsEpoch = (qp("treat_delay_as_epoch") !== "0"); // default ON, pass ...=0 to disable
 
   return { stationRaw, stopIdsParam, maxPerRoute, windowSeconds, showDebug, rawDump, format, speechLimit, speechDirection, treatDelayAsEpoch };
 }
