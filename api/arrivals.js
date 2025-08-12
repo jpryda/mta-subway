@@ -308,38 +308,37 @@ export default async function handler(req, res) {
         if (n === 1) return "1 minute";
         return `${n} minutes`;
       }
-      function dirLabel(code) {
+      function dirWord(code) {
         if (code === "N") return "northbound";
         if (code === "S") return "southbound";
         return "";
       }
-      function matchesDirection(entry) {
-        if (speechDirection === "BOTH") return true;
-        return entry.direction === speechDirection;
-      }
 
       const perStationSentences = {};
       for (const [stationName, routes] of Object.entries(stationsObj)) {
-        // Collect arrivals across all routes
+        // Collect arrivals across all routes and split by direction
         const all = [];
         for (const [routeId, arrs] of Object.entries(routes)) {
           for (const a of arrs) all.push({ route: routeId, ...a });
         }
-        // Filter by direction
         const north = all.filter(a => a.direction === "N").sort((x, y) => (x.arrival_epoch ?? Infinity) - (y.arrival_epoch ?? Infinity));
         const south = all.filter(a => a.direction === "S").sort((x, y) => (x.arrival_epoch ?? Infinity) - (y.arrival_epoch ?? Infinity));
 
+        const speechLimit = Math.max(1, Number(url.searchParams.get("speech_limit") || 2));
+        const speechDirection = (url.searchParams.get("speech_direction") || "N").toUpperCase(); // N|S|BOTH
+
         let sentence = `${stationName}: `;
+
         if (speechDirection === "N") {
           const top = north.slice(0, speechLimit);
           sentence += top.length
-            ? top.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`).join("; ") + "."
-            : "no northbound trains listed.";
+            ? `northbound: ${top.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`).join("; ")}.`
+            : "northbound: none.";
         } else if (speechDirection === "S") {
           const top = south.slice(0, speechLimit);
           sentence += top.length
-            ? top.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`).join("; ") + "."
-            : "no southbound trains listed.";
+            ? `southbound: ${top.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`).join("; ")}.`
+            : "southbound: none.";
         } else { // BOTH
           const nTop = north.slice(0, speechLimit);
           const sTop = south.slice(0, speechLimit);
@@ -352,12 +351,14 @@ export default async function handler(req, res) {
             : "southbound: none");
           sentence += parts.join(". ") + ".";
         }
+
         perStationSentences[stationName] = sentence;
       }
 
       const ordered = (stationsResolved.length ? stationsResolved : Object.keys(perStationSentences));
       const speech = ordered.map(n => perStationSentences[n]).filter(Boolean).join(" ");
 
+      const meta = { /* keep your existing meta build here */ };
       const speechPayload = { meta, speech, stations_speech: perStationSentences };
       if (showDebug) {
         speechPayload.debug = {
@@ -369,6 +370,7 @@ export default async function handler(req, res) {
       return res.status(200).json(speechPayload);
     }
     // ---- End speech mode ----
+
 
     // Default JSON (non-speech)
     const payload = { meta, stations: stationsObj };
