@@ -102,11 +102,37 @@ export default async function handler(req, res) {
     const stationRaw = url.searchParams.get("station");
     const stopIdsParam = url.searchParams.get("stop_ids");
     const maxPerRoute = Math.max(1, Math.min(10, Number(url.searchParams.get("max_per_route") || 5)));
-    const windowSeconds = Number(url.searchParams.get("window_seconds") || 0); // 0 = future-only
+    const lookbackSeconds = Number(url.searchParams.get("lookback_seconds") || 0); // 0 = future-only
     const showDebug = url.searchParams.get("show_debug") === "1";
     const rawDump = url.searchParams.get("raw_dump") === "1";
     const format = url.searchParams.get("format"); // "speech" to enable speech mode
-    const SPEECH_LIMIT = 2; // two next northbound per station
+
+    // Read parameters
+    const speechLimit = Math.max(1, Number(url.searchParams.get("speech_limit") || 2));
+    const speechDirection = (url.searchParams.get("speech_direction") || "N").toUpperCase();
+
+    // Function to check if a stop_id matches desired direction
+    function matchesDirection(stopId) {
+      if (speechDirection === "BOTH") return true;
+      return stopId.endsWith(speechDirection);
+    }
+
+    // When building speech text
+    for (const [stationName, routes] of Object.entries(stationsOut)) {
+      speechParts.push(`${stationName}:`);
+
+      for (const [route, arrivals] of Object.entries(routes)) {
+        const filtered = arrivals.filter(a => matchesDirection(a.stop_id));
+
+        const top = filtered.slice(0, speechLimit);
+        if (top.length === 0) {
+          speechParts.push(`  No upcoming ${speechDirection === "BOTH" ? "" : (speechDirection === "N" ? "northbound" : "southbound")} ${route} trains.`);
+        } else {
+          const times = top.map(a => `${a.in_min} min`).join(", ");
+          speechParts.push(`  ${route}: ${times}`);
+        }
+      }
+    }
 
     // Resolve inputs
     const stationsResolved = [];
@@ -259,10 +285,10 @@ export default async function handler(req, res) {
           }
 
           // Time filter
-          if (windowSeconds === 0) {
+          if (lookbackSeconds === 0) {
             if (ts < now) continue;
           } else {
-            if (ts < now - windowSeconds) continue;
+            if (ts < now - lookbackSeconds) continue;
           }
 
           matchedWithTime++;
@@ -295,7 +321,7 @@ export default async function handler(req, res) {
       stop_ids: stopIds,
       generated_at: Math.floor(Date.now() / 1000),
       max_per_route: maxPerRoute,
-      window_seconds: windowSeconds,
+      lookback_seconds: lookbackSeconds,
       expected_routes: stationsResolved.reduce((acc, name) => {
         acc[name] = expectedRoutesByStation[name] || null;
         return acc;
@@ -323,7 +349,7 @@ export default async function handler(req, res) {
           }
         }
         northbound.sort((x, y) => (x.arrival_epoch ?? Infinity) - (y.arrival_epoch ?? Infinity));
-        const top = northbound.slice(0, SPEECH_LIMIT);
+        const top = northbound.slice(0, speechLimit);
 
         let sentence;
         if (!top.length) {
