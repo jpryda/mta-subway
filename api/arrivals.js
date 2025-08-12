@@ -332,23 +332,23 @@ export default async function handler(req, res) {
         if (speechDirection === "N") {
           const top = north.slice(0, speechLimit);
           sentence += top.length
-            ? `northbound: ${top.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`).join("; ")}.`
-            : "northbound: none.";
+            ? `(northbound) ${top.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`).join("; ")}.`
+            : "(northbound) none.";
         } else if (speechDirection === "S") {
           const top = south.slice(0, speechLimit);
           sentence += top.length
-            ? `southbound: ${top.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`).join("; ")}.`
-            : "southbound: none.";
+            ? `(southbound) ${top.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`).join("; ")}.`
+            : "(southbound) none.";
         } else { // BOTH
           const nTop = north.slice(0, speechLimit);
           const sTop = south.slice(0, speechLimit);
           const parts = [];
           parts.push(nTop.length
-            ? `northbound: ${nTop.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`).join("; ")}`
-            : "northbound: none");
+            ? `(northbound) ${nTop.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`).join("; ")}`
+            : "(northbound) none");
           parts.push(sTop.length
-            ? `southbound: ${sTop.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`).join("; ")}`
-            : "southbound: none");
+            ? `(southbound) ${sTop.map(t => `${t.route} in ${fmtMinutes(t.in_min)}`).join("; ")}`
+            : "(southbound) none");
           sentence += parts.join(". ") + ".";
         }
 
