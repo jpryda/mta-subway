@@ -1,10 +1,12 @@
 // Vercel Serverless Function: MTA GTFS-RT → JSON (no API key)
-// - Grouped by station; multi-station; prefix stop_id match.
+// - Station resolution from bundled name→baseId map (no hardcoded station map).
+// - Base IDs (no N/S) used to match both directions via prefix.
 // - format=speech supports speech_limit (default 2) and speech_direction=N|S|BOTH.
 // - Epoch-in-delay fallback is ALWAYS ON (treatDelayAsEpoch = true).
 // - Debug: show_debug=1 (with optional raw_dump=1) returns interpreter details.
 
 import protobuf from "protobufjs";
+import NAME_TO_BASE from "./stops.name_to_id.min.json" assert { type: "json" };
 
 const FEEDS = [
   "nyct%2Fgtfs-ace",
@@ -39,30 +41,24 @@ message Event { optional int64 time = 1; optional int32 delay = 2; optional int3
 `;
 const FeedMessage = protobuf.parse(SCHEMA).root.lookupType("transit_realtime.FeedMessage");
 
-// Utilities
+// --- Name map indexes (built once per cold start) ---
 const norm = s => (s || "").toLowerCase().replace(/street\b/g, "st").replace(/\s+/g, " ").trim();
+const NAME_NORM_TO_BASE = {};
+const BASE_TO_NAME = {};
+for (const [stationName, baseIds] of Object.entries(NAME_TO_BASE)) {
+  NAME_NORM_TO_BASE[norm(stationName)] = baseIds;
+  for (const baseId of baseIds) BASE_TO_NAME[baseId] = stationName; // canonical GTFS name
+}
+
+// Utils
 const dirFromStopId = sid => (sid && /[NS]$/.test(sid) ? sid.slice(-1) : null);
 const asIso = sec => (sec == null ? null : new Date(Number(sec) * 1000).toISOString());
 const prefixMatch = (sid, ids) => !!sid && ids.some(id => sid.startsWith(id));
 
-// Example station maps (extend as needed)
-const STATION_TO_STOP_IDS = {
-  "clark st": ["231"],
-  "clark street": ["231"],
-  "high st": ["A40"],
-  "high street": ["A40"],
-};
-const STATION_EXPECTED_ROUTES = {
-  "clark st": ["2", "3"],
-  "clark street": ["2", "3"],
-  "high st": ["A", "C"],
-  "high street": ["A", "C"],
-};
-
 async function fetchFeed(path) {
   try {
     const r = await fetch(API_BASE + path, {
-      headers: { "Accept": "application/x-protobuf", "User-Agent": "mta-arrivals/2.4 (+vercel)" }
+      headers: { "Accept": "application/x-protobuf", "User-Agent": "mta-arrivals/2.5 (+vercel)" }
     });
     if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
     return FeedMessage.decode(new Uint8Array(await r.arrayBuffer()));
@@ -77,43 +73,59 @@ function parseQuery(req) {
   const num = (k, d) => Number(qp(k) ?? d);
   const bool = k => qp(k) === "1";
 
-  const stationRaw = qp("station");
-  const stopIdsParam = qp("stop_ids");
+  const stationRaw = qp("station");              // comma-separated station names
+  const stopIdsParam = qp("stop_ids");           // optional: user-supplied ids (N/S allowed)
   const maxPerRoute = Math.max(1, Math.min(10, num("max_per_route", 5)));
-  const lookbackSeconds = num("lookback_seconds", 0); // 0=future-only
+  const windowSeconds = num("window_seconds", 0); // 0=future-only
   const showDebug = bool("show_debug");
   const rawDump = bool("raw_dump");
-  const format = qp("format"); // "speech" optional
+  const format = qp("format");                   // "speech"
   const speechLimit = Math.max(1, num("speech_limit", 2));
   const speechDirection = (qp("speech_direction") || "N").toUpperCase(); // N|S|BOTH
 
-  return { stationRaw, stopIdsParam, maxPerRoute, lookbackSeconds, showDebug, rawDump, format, speechLimit, speechDirection };
+  return { stationRaw, stopIdsParam, maxPerRoute, windowSeconds, showDebug, rawDump, format, speechLimit, speechDirection };
 }
 
+// Resolve stations from bundled map; produce BASE ids only (no N/S)
 function resolveStops(stationRaw, stopIdsParam) {
-  const stationsResolved = [];
+  const stationsResolved = [];       // canonical station names (for display)
   const unknownStations = [];
-  const stopIdsSet = new Set();
-  const baseToStation = new Map();
-  const expectedRoutesByStation = {};
+  const stopIdsSet = new Set();      // holds BASE ids (e.g., "231")
+  const baseToStation = new Map();   // baseId -> canonical name
+  const expectedRoutesByStation = {}; // left empty unless you add hints
 
   if (stationRaw) {
-    for (const name of stationRaw.split(",").map(s => s.trim()).filter(Boolean)) {
-      const key = norm(name);
-      const mapped = STATION_TO_STOP_IDS[key];
-      if (mapped?.length) {
-        stationsResolved.push(name);
-        for (const id of mapped) { stopIdsSet.add(id); baseToStation.set(id, name); }
-        expectedRoutesByStation[name] = STATION_EXPECTED_ROUTES[key] || [];
+    for (const raw of stationRaw.split(",").map(s => s.trim()).filter(Boolean)) {
+      const key = norm(raw);
+      const baseIds = NAME_NORM_TO_BASE[key];
+      if (baseIds?.length) {
+        const canonical = BASE_TO_NAME[baseIds[0]] || raw;
+        stationsResolved.push(canonical);
+        for (const baseId of baseIds) {
+          stopIdsSet.add(baseId);
+          baseToStation.set(baseId, canonical);
+        }
       } else {
-        unknownStations.push(name);
+        unknownStations.push(raw);
       }
     }
   }
 
-  if (stopIdsParam) for (const id of stopIdsParam.split(",").map(s => s.trim()).filter(Boolean)) stopIdsSet.add(id);
+  if (stopIdsParam) {
+    for (const id of stopIdsParam.split(",").map(s => s.trim()).filter(Boolean)) {
+      const baseId = id.replace(/[NS]$/, "");
+      stopIdsSet.add(baseId);
+      if (BASE_TO_NAME[baseId]) baseToStation.set(baseId, BASE_TO_NAME[baseId]);
+    }
+  }
 
-  return { stationsResolved, unknownStations, stopIds: Array.from(stopIdsSet), baseToStation, expectedRoutesByStation };
+  return {
+    stationsResolved,
+    unknownStations,
+    stopIds: Array.from(stopIdsSet),
+    baseToStation,
+    expectedRoutesByStation
+  };
 }
 
 function getTimes(stu) {
@@ -138,7 +150,7 @@ function getTimes(stu) {
 
 function pushArrival(stationsObj, baseToStation, sid, route, now, ts, extra = {}) {
   let stationName = "Unknown";
-  for (const [base, name] of baseToStation.entries()) if (sid.startsWith(base)) { stationName = name; break; }
+  for (const [base, name] of baseToStation.entries()) { if (sid.startsWith(base)) { stationName = name; break; } }
   const s = (stationsObj[stationName] ??= {});
   const r = (s[route] ??= []);
   r.push({
@@ -146,7 +158,7 @@ function pushArrival(stationsObj, baseToStation, sid, route, now, ts, extra = {}
     route,
     direction: dirFromStopId(sid),
     arrival_epoch: ts,
-    in_min: ts == null ? null : Math.max(0, Math.floor((ts - now) / 60)), // Round down to nearest minute to be conservative
+    in_min: ts == null ? null : Math.max(0, Math.round((ts - now) / 60)),
     ...extra
   });
 }
@@ -200,13 +212,13 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "No stop_ids resolved. Provide station=Clark St[,High St] and/or stop_ids=A40N,..." });
     }
 
-    const now = Math.floor(Date.now() / 1000); // Unix time integer
+    const now = Math.floor(Date.now() / 1000);
     const stats = { matchedNoTime: 0, matchedWithTime: 0, usedDelayAsTimeCount: 0, totalEntities: 0, totalTripUpdates: 0, totalStopTimeUpdates: 0 };
     const sampleSet = new Set(stopIds);
     const matchedNoTimeSet = new Set();
     const matchedNoTimeDetails = [];
     const stationsObj = {};
-    seedExpectedRoutes(stationsObj, expectedRoutesByStation);
+    seedExpectedRoutes(stationsObj, expectedRoutesByStation); // no-op unless you add hints
 
     // Fetch all feeds in parallel
     const results = await Promise.allSettled(FEEDS.map(fetchFeed));
@@ -259,7 +271,7 @@ export default async function handler(req, res) {
           }
 
           // Time window filter
-          if ((q.lookbackSeconds === 0 && ts < now) || (q.lookbackSeconds > 0 && ts < now - q.lookbackSeconds)) continue;
+          if ((q.windowSeconds === 0 && ts < now) || (q.windowSeconds > 0 && ts < now - q.windowSeconds)) continue;
 
           stats.matchedWithTime++;
           if (usedDelayAsTime) stats.usedDelayAsTimeCount++;
@@ -279,7 +291,7 @@ export default async function handler(req, res) {
       stop_ids: stopIds,
       generated_at: now,
       max_per_route: q.maxPerRoute,
-      lookback_seconds: q.lookbackSeconds,
+      window_seconds: q.windowSeconds,
       expected_routes: stationsResolved.reduce((acc, name) => { acc[name] = expectedRoutesByStation[name] || null; return acc; }, {})
     };
 
@@ -290,7 +302,7 @@ export default async function handler(req, res) {
         // Flatten and keep route id on each entry
         const all = Object.entries(routes).flatMap(([routeId, arrs]) => arrs.map(a => ({ ...a, route: routeId })));
 
-        // Build per-direction lists, dedup and sort by ETA (approaching at end due to Infinity)
+        // Build per-direction lists, dedupe and sort by ETA (approaching at end due to Infinity)
         const byDir = d => dedupeSpeech(
           all.filter(a => a.direction === d)
         ).sort((x, y) => (x.arrival_epoch ?? Infinity) - (y.arrival_epoch ?? Infinity));
@@ -354,7 +366,7 @@ export default async function handler(req, res) {
           total_entities: stats.totalEntities,
           total_trip_updates: stats.totalTripUpdates,
           total_stop_time_updates: stats.totalStopTimeUpdates,
-          sample_stop_ids: Array.from(sampleSet),
+          sample_stop_ids: Array.from(new Set([...sampleSet])),
           matched_no_time_ids: Array.from(matchedNoTimeSet),
           matched_no_time_details: matchedNoTimeDetails
         }
