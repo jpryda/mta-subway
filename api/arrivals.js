@@ -1,5 +1,6 @@
 // Vercel Serverless Function: MTA GTFS-RT → JSON (no API key)
 // - Grouped by station; multi-station; prefix stop_id match.
+// - Optional filtering by routes via ?routes=A,C,1 (works with or without station).
 // - format=speech supports speech_limit (default 2) and speech_direction=N|S|BOTH.
 // - Epoch-in-delay fallback is ALWAYS ON (treatDelayAsEpoch = true).
 // - Debug: show_debug=1 (with optional raw_dump=1) returns interpreter details.
@@ -45,24 +46,19 @@ const dirFromStopId = sid => (sid && /[NS]$/.test(sid) ? sid.slice(-1) : null);
 const asIso = sec => (sec == null ? null : new Date(Number(sec) * 1000).toISOString());
 const prefixMatch = (sid, ids) => !!sid && ids.some(id => sid.startsWith(id));
 
-// Example station maps (extend as needed)
+// Station map (keys are station names; values are base stop_ids WITHOUT N/S suffix)
+// Populate this with your prebuilt name→base-stop_id map.
 const STATION_TO_STOP_IDS = {
   "clark st": ["231"],
   "clark street": ["231"],
   "high st": ["A40"],
   "high street": ["A40"],
 };
-const STATION_EXPECTED_ROUTES = {
-  "clark st": ["2", "3"],
-  "clark street": ["2", "3"],
-  "high st": ["A", "C"],
-  "high street": ["A", "C"],
-};
 
 async function fetchFeed(path) {
   try {
     const r = await fetch(API_BASE + path, {
-      headers: { "Accept": "application/x-protobuf", "User-Agent": "mta-arrivals/2.4 (+vercel)" }
+      headers: { "Accept": "application/x-protobuf", "User-Agent": "mta-arrivals/2.5 (+vercel)" }
     });
     if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
     return FeedMessage.decode(new Uint8Array(await r.arrayBuffer()));
@@ -79,6 +75,11 @@ function parseQuery(req) {
 
   const stationRaw = qp("station");
   const stopIdsParam = qp("stop_ids");
+  const routesParam = qp("routes"); // e.g., "A,C,1"
+  const routesFilter = routesParam
+    ? routesParam.split(",").map(s => s.trim()).filter(Boolean).map(s => s.toUpperCase())
+    : null;
+
   const maxPerRoute = Math.max(1, Math.min(10, num("max_per_route", 5)));
   const lookbackSeconds = num("lookback_seconds", 0); // 0=future-only
   const showDebug = bool("show_debug");
@@ -87,7 +88,10 @@ function parseQuery(req) {
   const speechLimit = Math.max(1, num("speech_limit", 2));
   const speechDirection = (qp("speech_direction") || "N").toUpperCase(); // N|S|BOTH
 
-  return { stationRaw, stopIdsParam, maxPerRoute, lookbackSeconds, showDebug, rawDump, format, speechLimit, speechDirection };
+  return {
+    stationRaw, stopIdsParam, routesParam, routesFilter,
+    maxPerRoute, lookbackSeconds, showDebug, rawDump, format, speechLimit, speechDirection
+  };
 }
 
 function resolveStops(stationRaw, stopIdsParam) {
@@ -95,7 +99,6 @@ function resolveStops(stationRaw, stopIdsParam) {
   const unknownStations = [];
   const stopIdsSet = new Set();
   const baseToStation = new Map();
-  const expectedRoutesByStation = {};
 
   if (stationRaw) {
     for (const name of stationRaw.split(",").map(s => s.trim()).filter(Boolean)) {
@@ -104,7 +107,6 @@ function resolveStops(stationRaw, stopIdsParam) {
       if (mapped?.length) {
         stationsResolved.push(name);
         for (const id of mapped) { stopIdsSet.add(id); baseToStation.set(id, name); }
-        expectedRoutesByStation[name] = STATION_EXPECTED_ROUTES[key] || [];
       } else {
         unknownStations.push(name);
       }
@@ -113,7 +115,7 @@ function resolveStops(stationRaw, stopIdsParam) {
 
   if (stopIdsParam) for (const id of stopIdsParam.split(",").map(s => s.trim()).filter(Boolean)) stopIdsSet.add(id);
 
-  return { stationsResolved, unknownStations, stopIds: Array.from(stopIdsSet), baseToStation, expectedRoutesByStation };
+  return { stationsResolved, unknownStations, stopIds: Array.from(stopIdsSet), baseToStation };
 }
 
 function getTimes(stu) {
@@ -151,13 +153,6 @@ function pushArrival(stationsObj, baseToStation, sid, route, now, ts, extra = {}
   });
 }
 
-function seedExpectedRoutes(stationsObj, expectedRoutesByStation) {
-  for (const [stationName, routes] of Object.entries(expectedRoutesByStation)) {
-    const s = (stationsObj[stationName] ??= {});
-    for (const rt of routes) if (!s[rt]) s[rt] = [];
-  }
-}
-
 function sortAndTrim(stationsObj, maxPerRoute) {
   for (const routes of Object.values(stationsObj)) {
     for (const [route, arrs] of Object.entries(routes)) {
@@ -193,7 +188,7 @@ export default async function handler(req, res) {
 
   try {
     const q = parseQuery(req);
-    const { stationsResolved, unknownStations, stopIds, baseToStation, expectedRoutesByStation } =
+    const { stationsResolved, unknownStations, stopIds, baseToStation } =
       resolveStops(q.stationRaw, q.stopIdsParam);
 
     if (!stopIds.length) {
@@ -206,7 +201,6 @@ export default async function handler(req, res) {
     const matchedNoTimeSet = new Set();
     const matchedNoTimeDetails = [];
     const stationsObj = {};
-    seedExpectedRoutes(stationsObj, expectedRoutesByStation);
 
     // Fetch all feeds in parallel
     const results = await Promise.allSettled(FEEDS.map(fetchFeed));
@@ -220,7 +214,10 @@ export default async function handler(req, res) {
         if (!tu) continue;
         stats.totalTripUpdates++;
 
-        const route = tu.trip?.routeId || "?";
+        const route = (tu.trip?.routeId || "?").toUpperCase();
+        // If routes filter present, skip other routes
+        if (q.routesFilter && !q.routesFilter.includes(route)) continue;
+
         for (const stu of tu.stopTimeUpdate || []) {
           stats.totalStopTimeUpdates++;
           const sid = stu.stopId;
@@ -277,10 +274,10 @@ export default async function handler(req, res) {
       stations: stationsResolved.length ? stationsResolved : null,
       unknown_stations: unknownStations.length ? unknownStations : null,
       stop_ids: stopIds,
+      routes: q.routesFilter || null,
       generated_at: now,
       max_per_route: q.maxPerRoute,
-      lookback_seconds: q.lookbackSeconds,
-      expected_routes: stationsResolved.reduce((acc, name) => { acc[name] = expectedRoutesByStation[name] || null; return acc; }, {})
+      lookback_seconds: q.lookbackSeconds
     };
 
     // ---- Speech mode ----
