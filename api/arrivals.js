@@ -1,7 +1,8 @@
 // Vercel Serverless Function: MTA GTFS-RT → JSON (no API key)
-// - Grouped by station; multi-station; prefix stop_id match.
+// - Grouped by station; multi-station; base stop_id match (N/S kept on items).
 // - Optional filtering by routes via ?routes=A,C,1 (works with or without station).
-// - format=speech supports speech_limit (default 2) and speech_direction=N|S|BOTH.
+// - NEW: route_direction=N|S|BOTH filters **data** (JSON + speech). Default BOTH.
+// - format=speech supports speech_limit (default 2).
 // - Epoch-in-delay fallback is ALWAYS ON (treatDelayAsEpoch = true).
 // - Debug: show_debug=1 (with optional raw_dump=1) returns interpreter details.
 
@@ -46,9 +47,9 @@ const FeedMessage = protobuf.parse(SCHEMA).root.lookupType("transit_realtime.Fee
 const norm = s => (s || "").toLowerCase().replace(/street\b/g, "st").replace(/\s+/g, " ").trim();
 const dirFromStopId = sid => (sid && /[NS]$/.test(sid) ? sid.slice(-1) : null);
 const asIso = sec => (sec == null ? null : new Date(Number(sec) * 1000).toISOString());
-// NOTE: kept for reference, but we no longer use prefixMatch for performance
+// Kept for reference
 const prefixMatch = (sid, ids) => !!sid && ids.some(id => sid.startsWith(id));
-// New: base stop_id helper for O(1) membership checks
+// Base stop_id helper for O(1) membership checks
 const baseOf = sid => (sid && (sid.endsWith("N") || sid.endsWith("S"))) ? sid.slice(0, -1) : sid;
 
 // Build normalized index: Map<normalizedStationName, string[] of base stop_ids>
@@ -90,11 +91,11 @@ function parseQuery(req) {
   const rawDump = bool("raw_dump");
   const format = qp("format"); // "speech" optional
   const speechLimit = Math.max(1, num("speech_limit", 2));
-  const speechDirection = (qp("speech_direction") || "N").toUpperCase(); // N|S|BOTH
+  const routeDirection = (qp("route_direction") || "BOTH").toUpperCase(); // N|S|BOTH
 
   return {
     stationRaw, stopIdsParam, routesParam, routesFilter,
-    maxPerRoute, lookbackSeconds, showDebug, rawDump, format, speechLimit, speechDirection
+    maxPerRoute, lookbackSeconds, showDebug, rawDump, format, speechLimit, routeDirection
   };
 }
 
@@ -123,7 +124,7 @@ function resolveStops(stationRaw, stopIdsParam) {
     }
   }
 
-  // return both the array (for debug/meta) and the Set (for hot-path checks)
+  // Return both for debug + hot-path checks
   return { stationsResolved, unknownStations, stopIds: Array.from(stopIdsSet), stopIdsSet, baseToStation };
 }
 
@@ -234,10 +235,12 @@ export default async function handler(req, res) {
         for (const stu of tu.stopTimeUpdate || []) {
           stats.totalStopTimeUpdates++;
           const sid = stu.stopId;
-
-          // ***** BIGGEST WIN: O(1) base stop_id membership check *****
           const base = baseOf(sid);
-          if (!base || !stopIdsSet.has(base)) continue;
+          if (!base || !stopIdsSet.has(base)) continue; // O(1) base-id match
+
+          // NEW: filter by direction before pushing
+          const direction = dirFromStopId(sid); // "N" | "S" | null
+          if (q.routeDirection !== "BOTH" && direction !== q.routeDirection) continue;
 
           sampleSet.add(sid);
 
@@ -292,6 +295,7 @@ export default async function handler(req, res) {
       unknown_stations: unknownStations.length ? unknownStations : null,
       stop_ids: stopIds,
       routes: q.routesFilter || null,
+      route_direction: q.routeDirection,
       generated_at: now,
       max_per_route: q.maxPerRoute,
       lookback_seconds: q.lookbackSeconds
@@ -313,11 +317,11 @@ export default async function handler(req, res) {
         const south = byDir("S").slice(0, q.speechLimit);
 
         let sentence = `${stationName}: `;
-        if (q.speechDirection === "N") {
+        if (q.routeDirection === "N") {
           sentence += north.length
             ? `(northbound) ${north.map(sayArrival).join("; ")}.`
             : "(northbound) none.";
-        } else if (q.speechDirection === "S") {
+        } else if (q.routeDirection === "S") {
           sentence += south.length
             ? `(southbound) ${south.map(sayArrival).join("; ")}.`
             : "(southbound) none.";
