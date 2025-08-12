@@ -46,7 +46,10 @@ const FeedMessage = protobuf.parse(SCHEMA).root.lookupType("transit_realtime.Fee
 const norm = s => (s || "").toLowerCase().replace(/street\b/g, "st").replace(/\s+/g, " ").trim();
 const dirFromStopId = sid => (sid && /[NS]$/.test(sid) ? sid.slice(-1) : null);
 const asIso = sec => (sec == null ? null : new Date(Number(sec) * 1000).toISOString());
+// NOTE: kept for reference, but we no longer use prefixMatch for performance
 const prefixMatch = (sid, ids) => !!sid && ids.some(id => sid.startsWith(id));
+// New: base stop_id helper for O(1) membership checks
+const baseOf = sid => (sid && (sid.endsWith("N") || sid.endsWith("S"))) ? sid.slice(0, -1) : sid;
 
 // Build normalized index: Map<normalizedStationName, string[] of base stop_ids>
 const STATION_INDEX = new Map(
@@ -120,7 +123,8 @@ function resolveStops(stationRaw, stopIdsParam) {
     }
   }
 
-  return { stationsResolved, unknownStations, stopIds: Array.from(stopIdsSet), baseToStation };
+  // return both the array (for debug/meta) and the Set (for hot-path checks)
+  return { stationsResolved, unknownStations, stopIds: Array.from(stopIdsSet), stopIdsSet, baseToStation };
 }
 
 function getTimes(stu) {
@@ -195,7 +199,7 @@ export default async function handler(req, res) {
 
   try {
     const q = parseQuery(req);
-    const { stationsResolved, unknownStations, stopIds, baseToStation } =
+    const { stationsResolved, unknownStations, stopIds, stopIdsSet, baseToStation } =
       resolveStops(q.stationRaw, q.stopIdsParam);
 
     if (!stopIds.length) {
@@ -230,7 +234,11 @@ export default async function handler(req, res) {
         for (const stu of tu.stopTimeUpdate || []) {
           stats.totalStopTimeUpdates++;
           const sid = stu.stopId;
-          if (!prefixMatch(sid, stopIds)) continue;
+
+          // ***** BIGGEST WIN: O(1) base stop_id membership check *****
+          const base = baseOf(sid);
+          if (!base || !stopIdsSet.has(base)) continue;
+
           sampleSet.add(sid);
 
           const { ts, usedDelayAsTime, delaySeconds, aTime, dTime, aDelay, dDelay } = getTimes(stu);
