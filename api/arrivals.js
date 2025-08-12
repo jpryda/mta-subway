@@ -7,7 +7,7 @@
 
 import protobuf from "protobufjs";
 // Load name→base stop_id[] index (minified JSON) and normalize keys once
-import stationIndexRaw from "../data/station_index.min.json" assert { type: "json" };
+import stationIndexRaw from "../data/station_index.min.json" with { type: "json" };
 
 const FEEDS = [
   "nyct%2Fgtfs-ace",
