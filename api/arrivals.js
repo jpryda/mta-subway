@@ -190,6 +190,20 @@ const dedupeSpeech = (arr) => {
     return true;
   });
 };
+// New helper: collapse consecutive arrivals with same route
+function collapseSameRoute(arr) {
+  let lastRoute = null;
+  return arr.map((item, idx) => {
+    const currentRoute = item.route;
+    let spoken = sayArrival(item);
+    if (idx > 0 && currentRoute === lastRoute) {
+      // remove route name at start
+      spoken = spoken.replace(/^\S+\s+/, "");
+    }
+    lastRoute = currentRoute;
+    return spoken;
+  });
+}
 
 export default async function handler(req, res) {
   // CORS
@@ -319,18 +333,18 @@ export default async function handler(req, res) {
         let sentence = `${stationName}: `;
         if (q.routeDirection === "N") {
           sentence += north.length
-            ? `(northbound) ${north.map(sayArrival).join("; ")}.`
+            ? `(northbound) ${collapseSameRoute(north).join("; ")}.`
             : "(northbound) none.";
         } else if (q.routeDirection === "S") {
           sentence += south.length
-            ? `(southbound) ${south.map(sayArrival).join("; ")}.`
+            ? `(southbound) ${collapseSameRoute(north).join("; ")}.`
             : "(southbound) none.";
         } else {
           const nPart = north.length
-            ? `(northbound) ${north.map(sayArrival).join("; ")}`
+            ? `(northbound) ${collapseSameRoute(north).join("; ")}`
             : "(northbound) none";
           const sPart = south.length
-            ? `(southbound) ${south.map(sayArrival).join("; ")}`
+            ? `(southbound) ${collapseSameRoute(north).join("; ")}`
             : "(southbound) none";
           sentence += `${nPart}. ${sPart}.`;
         }
