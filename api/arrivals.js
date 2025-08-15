@@ -337,14 +337,14 @@ export default async function handler(req, res) {
             : "(northbound) none.";
         } else if (q.routeDirection === "S") {
           sentence += south.length
-            ? `(southbound) ${collapseSameRoute(north).join("; ")}.`
+            ? `(southbound) ${collapseSameRoute(south).join("; ")}.`
             : "(southbound) none.";
         } else {
           const nPart = north.length
             ? `(northbound) ${collapseSameRoute(north).join("; ")}`
             : "(northbound) none";
           const sPart = south.length
-            ? `(southbound) ${collapseSameRoute(north).join("; ")}`
+            ? `(southbound) ${collapseSameRoute(south).join("; ")}`
             : "(southbound) none";
           sentence += `${nPart}. ${sPart}.`;
         }
