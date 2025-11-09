@@ -175,12 +175,6 @@ function sortAndTrim(stationsObj, maxPerRoute) {
 }
 
 // Speech helpers
-const sayArrival = (t) => {
-  if (t.in_min == null) return `${t.route} is approaching`;
-  if (t.in_min <= 0)   return `${t.route} is arriving now`;
-  if (t.in_min === 1)  return `${t.route} in 1 minute`;
-  return `${t.route} in ${t.in_min} minutes`;
-};
 const dedupeSpeech = (arr) => {
   const seen = new Set();
   return arr.filter(a => {
@@ -203,7 +197,7 @@ function collapseSameRoute(arr) {
     const spokenTimes = times.length === 1
       ? (times[0] === 0 ? "arriving now" : times[0] === 1 ? "in 1 minute" : `in ${times[0]} minutes`)
       : `in ${times.slice(0, -1).join(", ")} and ${times[times.length - 1]} minutes`;
-    merged.push(`${currentRoute} is ${spokenTimes}`);
+    merged.push(`${currentRoute} ${spokenTimes}`);
   };
 
   for (const t of arr) {
