@@ -192,18 +192,33 @@ const dedupeSpeech = (arr) => {
 };
 // New helper: collapse consecutive arrivals with same route
 function collapseSameRoute(arr) {
-  let lastRoute = null;
-  return arr.map((item, idx) => {
-    const currentRoute = item.route;
-    let spoken = sayArrival(item);
-    if (idx > 0 && currentRoute === lastRoute) {
-      // remove route name at start
-      spoken = spoken.replace(/^\S+\s+/, "");
+  if (!arr.length) return [];
+
+  const merged = [];
+  let currentRoute = arr[0].route;
+  let times = [];
+
+  const flush = () => {
+    if (times.length === 0) return;
+    const spokenTimes = times.length === 1
+      ? (times[0] === 0 ? "arriving now" : times[0] === 1 ? "in 1 minute" : `in ${times[0]} minutes`)
+      : `in ${times.slice(0, -1).join(", ")} and ${times[times.length - 1]} minutes`;
+    merged.push(`${currentRoute} is ${spokenTimes}`);
+  };
+
+  for (const t of arr) {
+    if (t.route !== currentRoute) {
+      flush();
+      currentRoute = t.route;
+      times = [];
     }
-    lastRoute = currentRoute;
-    return spoken;
-  });
+    if (t.in_min != null) times.push(t.in_min);
+    else times.push("approaching");
+  }
+  flush();
+  return merged;
 }
+
 
 export default async function handler(req, res) {
   // CORS
